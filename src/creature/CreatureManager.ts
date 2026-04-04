@@ -1,5 +1,5 @@
-import { CreatureData, Species, Position, CodingDNA, FileHealth } from '../types';
-import { MAX_CREATURES } from '../constants';
+import { CreatureData, Species, Position, CodingDNA, FileHealth, MutationType } from '../types';
+import { MAX_CREATURES, NEGLECT_DEATH_DAYS, NEGLECT_WARNING_DAYS, MS_PER_DAY } from '../constants';
 import {
   createCreature,
   updateHatchProgress,
@@ -101,8 +101,14 @@ export class CreatureManager {
     }
   }
 
-  /** Update file health and return improvement info for reward calculation */
-  updateFileHealth(sourceFile: string, health: FileHealth): { improved: boolean; bugsDelta: number; linesDelta: number } | null {
+  /** Update file health and return detailed change info */
+  updateFileHealth(sourceFile: string, health: FileHealth): {
+    improved: boolean;
+    worsened: boolean;
+    bugsDelta: number;
+    linesDelta: number;
+    nestingDelta: number;
+  } | null {
     const creatureId = this.fileToCreatureId.get(sourceFile);
     if (!creatureId) { return null; }
     const creature = this.creatures.get(creatureId);
@@ -111,10 +117,14 @@ export class CreatureManager {
     const prev = creature.fileHealth;
     const bugsDelta = prev.bugCount - health.bugCount;  // positive = bugs fixed
     const linesDelta = prev.lineCount - health.lineCount; // positive = lines reduced
+    const nestingDelta = (prev.maxNesting ?? 0) - (health.maxNesting ?? 0); // positive = shallower
 
     let expReward = 0;
-    if (bugsDelta > 0) { expReward += bugsDelta * 10; }  // 10 EXP per bug fixed
-    if (linesDelta > 50) { expReward += 15; }             // 15 EXP for significant slimming
+    if (bugsDelta > 0) { expReward += bugsDelta * 10; }
+    if (linesDelta > 50) { expReward += 15; }
+    if (nestingDelta > 2) { expReward += 10; }
+
+    const worsened = bugsDelta < -1 || linesDelta < -50 || nestingDelta < -2;
 
     let updated: CreatureData = { ...creature, fileHealth: health };
     if (expReward > 0) {
@@ -124,8 +134,10 @@ export class CreatureManager {
 
     return {
       improved: expReward > 0,
+      worsened,
       bugsDelta,
       linesDelta,
+      nestingDelta,
     };
   }
 
@@ -154,6 +166,45 @@ export class CreatureManager {
       if (creature.targetPosition) {
         this.creatures.set(id, { ...creature, targetPosition: null });
       }
+    }
+  }
+
+  /** Check for neglected creatures. Returns { critical, dead } creature lists */
+  checkNeglect(): { critical: CreatureData[]; dead: CreatureData[] } {
+    const now = Date.now();
+    const critical: CreatureData[] = [];
+    const dead: CreatureData[] = [];
+
+    for (const [id, creature] of this.creatures) {
+      if (creature.stage === 'egg') continue;
+
+      const daysSinceLastFed = (now - creature.lastFed) / MS_PER_DAY;
+
+      if (daysSinceLastFed >= NEGLECT_DEATH_DAYS) {
+        dead.push(creature);
+      } else if (daysSinceLastFed >= NEGLECT_WARNING_DAYS && !creature.neglectWarned) {
+        critical.push(creature);
+        this.creatures.set(id, { ...creature, neglectWarned: true });
+      }
+    }
+
+    return { critical, dead };
+  }
+
+  /** Remove a creature by ID (for neglect death) */
+  removeCreatureById(id: string): CreatureData | null {
+    const creature = this.creatures.get(id);
+    if (!creature) return null;
+    this.creatures.delete(id);
+    this.fileToCreatureId.delete(creature.sourceFile);
+    return creature;
+  }
+
+  /** Set mutation on a creature */
+  setMutation(creatureId: string, mutation: MutationType): void {
+    const creature = this.creatures.get(creatureId);
+    if (creature) {
+      this.creatures.set(creatureId, { ...creature, mutation });
     }
   }
 

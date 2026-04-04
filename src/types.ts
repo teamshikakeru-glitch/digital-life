@@ -14,11 +14,15 @@ export interface FileHealth {
   readonly lineCount: number;
   readonly bugCount: number;
   readonly lastModified: number; // epoch ms
+  readonly maxNesting: number;      // deepest indentation level
+  readonly longestFunction: number; // lines in the longest function
 }
 
 // --- Creature ---
 
 export type Species = 'puff' | 'blob' | 'pip' | 'wisp' | 'chomp' | 'dot';
+
+export type MutationType = 'nightGlow' | 'rainbow' | 'speedster' | 'zen' | 'hyperactive' | null;
 export type CreatureStage = 'egg' | 'baby' | 'adult';
 export type CreatureMood = 'happy' | 'neutral' | 'sad';
 
@@ -64,11 +68,15 @@ export interface CreatureData {
   readonly level: number;
   readonly dna: CodingDNA;
   readonly fileHealth: FileHealth;
+  readonly mutation: MutationType;
+  readonly neglectWarned: boolean;  // true if critical notification already shown
 }
 
 // --- World ---
 
 export type Weather = 'sunny' | 'cloudy' | 'rainy';
+export type TimeOfDay = 'dawn' | 'morning' | 'afternoon' | 'dusk' | 'night';
+export type RealWeather = 'clear' | 'cloudy' | 'rain' | 'snow' | 'fog' | null;
 
 export type TileType =
   | 'grass_light'
@@ -98,11 +106,36 @@ export interface GraveStone {
   readonly position: Position;
 }
 
+/** ISS overhead pass data */
+export interface ISSData {
+  readonly visible: boolean;     // true when ISS is near user's location
+  readonly lat: number;
+  readonly lon: number;
+}
+
+/** Near-Earth asteroid count for today */
+export interface NEOData {
+  readonly count: number;        // number of asteroids approaching today
+}
+
 export interface WorldData {
   readonly weather: Weather;
+  readonly timeOfDay: TimeOfDay;
+  readonly realWeather: RealWeather;
+  readonly iss: ISSData | null;
+  readonly neo: NEOData | null;
   readonly environmentObjects: readonly EnvironmentObject[];
   readonly tileMap: readonly (readonly TileType[])[]; // legacy, kept for stored state compat
   readonly graveStones: readonly GraveStone[];
+}
+
+// --- Commit ---
+
+export interface CommitStats {
+  readonly insertions: number;
+  readonly deletions: number;
+  readonly filesChanged: number;
+  readonly streak: number;
 }
 
 // --- Monitor ---
@@ -120,19 +153,23 @@ export type ExtToWebMessage =
   | { readonly type: 'worldUpdate'; readonly creatures: readonly CreatureData[]; readonly world: WorldData; readonly bugs: number; readonly agents: readonly AgentData[] }
   | { readonly type: 'creatureBorn'; readonly creature: CreatureData }
   | { readonly type: 'creatureDied'; readonly creatureId: string; readonly creatureName: string }
-  | { readonly type: 'commitDetected' }
+  | { readonly type: 'commitDetected'; readonly stats?: CommitStats }
   | { readonly type: 'bugCountChanged'; readonly count: number }
   | { readonly type: 'agentChat'; readonly agentId: string; readonly message: string }
   | { readonly type: 'aiActionPreview'; readonly creatureId: string; readonly action: string; readonly description: string }
   | { readonly type: 'creatureHealed'; readonly creatureId: string; readonly creatureName: string }
+  | { readonly type: 'creatureWorsened'; readonly creatureId: string }
   | { readonly type: 'creatureSpeech'; readonly creatureId: string; readonly text: string }
+  | { readonly type: 'creatureCritical'; readonly creatureId: string; readonly creatureName: string }
+  | { readonly type: 'mutationUnlocked'; readonly creatureId: string; readonly mutation: MutationType }
   | { readonly type: 'creatureSuggestion'; readonly creatureId: string; readonly creatureName: string; readonly action: string; readonly description: string }
   | { readonly type: 'friendships'; readonly pairs: readonly { a: string; b: string }[] }
-  | { readonly type: 'diary'; readonly creatureId: string; readonly entry: string }
+  | { readonly type: 'nudgeCreature'; readonly creatureId: string }
   | { readonly type: 'firstRun'; readonly files: readonly { path: string; name: string; species: string }[] }
   | { readonly type: 'levelUp'; readonly creatureId: string }
   | { readonly type: 'agentAdded'; readonly agentId: string }
-  | { readonly type: 'lineupActive'; readonly active: boolean };
+  | { readonly type: 'fileSaved'; readonly creatureId: string }
+  | { readonly type: 'settings'; readonly realWeather: boolean; readonly language: string; readonly sound: boolean; readonly saveReaction: boolean }
 
 export type WebToExtMessage =
   | { readonly type: 'ready' }
@@ -152,9 +189,11 @@ export type WebToExtMessage =
   | { readonly type: 'sitAgent'; readonly agentId: string; readonly sitting: boolean }
   | { readonly type: 'deleteAgent'; readonly agentId: string }
   | { readonly type: 'clearAllCreatures' }
+  | { readonly type: 'clearGraveStones' }
   | { readonly type: 'revealFile'; readonly creatureId: string }
   | { readonly type: 'spawnFile'; readonly filePath: string; readonly name: string }
-  | { readonly type: 'lineup' };
+  | { readonly type: 'screenshot'; readonly imageData: string }
+;
 
 // --- Agent ---
 
@@ -178,11 +217,14 @@ export interface AgentData {
 // --- Storage ---
 
 export interface StoredState {
+  readonly version: number;
   readonly creatures: readonly CreatureData[];
   readonly world: WorldData;
   readonly monitorState: MonitorState;
   readonly agents: readonly AgentData[];
 }
+
+export const STORED_STATE_VERSION = 1;
 
 // --- Sprite ---
 

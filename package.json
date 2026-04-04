@@ -1,7 +1,7 @@
 {
   "name": "shikakeru-digital-life",
   "displayName": "Digital Life by SHIKAKERU",
-  "description": "Your code becomes a world. Digital creatures live in your VS Code, reflecting the health of your codebase.",
+  "description": "Your code becomes a world. Digital creatures live in your VS Code, reflecting the health of your codebase. Uses ipinfo.io for geolocation and Open-Meteo for weather data (no API key required, no personal data stored).",
   "version": "0.1.0",
   "publisher": "shikakeru",
   "license": "MIT",
@@ -69,15 +69,54 @@
       {
         "command": "digitalLife.adoptFiles",
         "title": "Digital Life: Adopt Existing Files"
+      },
+      {
+        "command": "digitalLife.clearGraves",
+        "title": "Digital Life: Clear Gravestones"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Digital Life",
+      "properties": {
+        "digitalLife.realWeather": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show real weather from Open-Meteo API"
+        },
+        "digitalLife.language": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "en",
+            "ja",
+            "zh-TW",
+            "zh-CN",
+            "ko",
+            "es"
+          ],
+          "default": "auto",
+          "description": "UI language (auto = follow VS Code language)"
+        },
+        "digitalLife.sound": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable sound effects"
+        },
+        "digitalLife.saveReaction": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show sparkle effect when files are saved"
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run build",
     "build": "webpack --mode production",
     "watch": "webpack --mode development --watch",
     "lint": "eslint src --ext ts",
-    "compile-tests": "tsc -p ./tsconfig.json"
+    "compile-tests": "tsc -p ./tsconfig.json",
+    "test": "vitest run"
   },
   "dependencies": {
     "chokidar": "^3.6.0",
@@ -92,6 +131,7 @@
     "eslint": "^8.56.0",
     "ts-loader": "^9.5.0",
     "typescript": "^5.3.0",
+    "vitest": "^4.1.2",
     "webpack": "^5.90.0",
     "webpack-cli": "^5.1.0"
   }

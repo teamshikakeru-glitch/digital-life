@@ -1,4 +1,4 @@
-import { CreatureData, AgentData, WorldData } from '../../../types';
+import { CreatureData, AgentData, WorldData, TimeOfDay, RealWeather } from '../../../types';
 import { CANVAS_WIDTH, CANVAS_HEIGHT } from '../../../constants';
 import { SpriteRenderer } from './SpriteRenderer';
 import { UIRenderer } from './UIRenderer';
@@ -18,7 +18,6 @@ export interface RenderContext {
   agentChats: Map<string, { message: string; timestamp: number }>;
   eventSpeechOverrides: Map<string, { text: string; timestamp: number }>;
   friendPairs: readonly { a: string; b: string }[];
-  lineupActive: boolean;
 }
 
 export class GameRenderer {
@@ -27,7 +26,12 @@ export class GameRenderer {
 
   private commitEffectProgress: number = 0;
   private commitEffectStart: number = 0;
-  private readonly COMMIT_EFFECT_DURATION = 2000;
+  private readonly COMMIT_EFFECT_DURATION = 3000;
+  private commitStreak: number = 0;
+  private commitCombo: number = 0;
+
+  // Firework particles for commit celebration
+  private fireworks: { x: number; y: number; vx: number; vy: number; color: string; born: number; life: number }[] = [];
 
   // Feed drop animation
   private feedEffects: { x: number; y: number; startTime: number }[] = [];
@@ -39,17 +43,53 @@ export class GameRenderer {
   // Healed creature IDs — SpriteRenderer uses this to override speech bubble
   private healedCreatureIds: Map<string, number> = new Map(); // id → timestamp
 
+  // Worsen effect (red flash per creature)
+  private worsenEffects: { x: number; y: number; startTime: number }[] = [];
+  private readonly WORSEN_EFFECT_DURATION = 1200;
+
+  // Save sparkle effect (file saved → creature shines)
+  private saveEffects: { x: number; y: number; startTime: number }[] = [];
+  private readonly SAVE_EFFECT_DURATION = 1000;
+
   // Farewell scene (file deletion)
   private farewellName: string | null = null;
   private farewellStart: number = 0;
-  private readonly FAREWELL_DURATION = 3000;
+  private readonly FAREWELL_DURATION = 5000; // Extended for emotional impact — 堀井雄二
 
   // Selected agent for keyboard control
   private selectedAgentId: string | null = null;
 
+  // FPS monitoring
+  private frameCount = 0;
+  private fpsTimestamp = 0;
+  private currentFps = 60;
+
+  // ISS fly-over animation
+  private issX = -40; // current X position on screen
+
+  // Shooting stars (NEO-driven)
+  private shootingStars: { x: number; y: number; vx: number; vy: number; life: number; born: number; length: number }[] = [];
+  private lastShootingStarSpawn = 0;
+
+  // Profile card toggle (default: collapsed)
+  private profileCardOpen = false;
+
   constructor(private readonly ctx: CanvasRenderingContext2D) {
     this.spriteRenderer = new SpriteRenderer(ctx);
     this.uiRenderer = new UIRenderer(ctx);
+  }
+
+  toggleProfileCard(): void {
+    this.profileCardOpen = !this.profileCardOpen;
+  }
+
+  isProfileCardOpen(): boolean {
+    return this.profileCardOpen;
+  }
+
+  /** Get the hit area for the collapsed profile badge (for click detection) */
+  getProfileBadgeRect(): { x: number; y: number; w: number; h: number } {
+    return { x: 6, y: CANVAS_HEIGHT - 26, w: 80, h: 20 };
   }
 
   setSelectedAgentId(id: string | null): void {
@@ -61,13 +101,41 @@ export class GameRenderer {
     this.uiRenderer.updateHealthCache(creatures);
   }
 
-  triggerCommitEffect(): void {
+  triggerCommitEffect(streak: number = 0, combo: number = 0): void {
     this.commitEffectProgress = 1.0;
     this.commitEffectStart = Date.now();
+    this.commitStreak = streak;
+    this.commitCombo = combo;
+
+    // Spawn firework particles — more for longer streaks
+    const count = 30 + Math.min(streak, 50) * 2;
+    const colors = ['#FFD700', '#FF6B6B', '#4FC3F7', '#81C784', '#CE93D8', '#FFB74D'];
+    this.fireworks = [];
+    for (let i = 0; i < count; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 1.5 + Math.random() * 3;
+      this.fireworks.push({
+        x: CANVAS_WIDTH / 2 + (Math.random() - 0.5) * 100,
+        y: CANVAS_HEIGHT / 2 + (Math.random() - 0.5) * 60,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed - 1,
+        color: colors[i % colors.length],
+        born: Date.now(),
+        life: 1500 + Math.random() * 1500,
+      });
+    }
   }
 
   triggerFeedEffect(worldX: number, worldY: number): void {
     this.feedEffects.push({ x: worldX, y: worldY, startTime: Date.now() });
+  }
+
+  triggerWorsenEffect(worldX: number, worldY: number): void {
+    this.worsenEffects.push({ x: worldX, y: worldY, startTime: Date.now() });
+  }
+
+  triggerSaveEffect(worldX: number, worldY: number): void {
+    this.saveEffects.push({ x: worldX, y: worldY, startTime: Date.now() });
   }
 
   triggerHealEffect(worldX: number, worldY: number, creatureId?: string): void {
@@ -94,17 +162,31 @@ export class GameRenderer {
   }
 
   render(rc: RenderContext): void {
+    // FPS tracking
+    this.frameCount++;
+    const now = performance.now();
+    if (now - this.fpsTimestamp >= 1000) {
+      this.currentFps = this.frameCount;
+      this.frameCount = 0;
+      this.fpsTimestamp = now;
+      if (this.currentFps < 30) {
+        // eslint-disable-next-line no-console
+        console.warn(`[Digital Life] Low FPS: ${this.currentFps}`);
+      }
+    }
+
     const {
       creatures, world, bugCount, zoom, panX: panOffsetX, panY: panOffsetY,
       selectedCreatureId, draggingCreatureId, agents, agentChats,
-      eventSpeechOverrides, friendPairs, lineupActive,
+      eventSpeechOverrides, friendPairs,
     } = rc;
 
     // Clear entire canvas (before any transform)
     this.ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
-    // Fill background color as fallback
-    this.ctx.fillStyle = '#F5F0E8';
+    // Time-of-day background — the world breathes with you
+    const bgColor = this.getTimeOfDayBackground(world.timeOfDay);
+    this.ctx.fillStyle = bgColor;
     this.ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
     // === World layer (affected by zoom & pan) ===
@@ -112,8 +194,7 @@ export class GameRenderer {
     this.ctx.translate(panOffsetX, panOffsetY);
     this.ctx.scale(zoom, zoom);
 
-    // Solid background color (no background image)
-    this.ctx.fillStyle = '#F5F0E8';
+    this.ctx.fillStyle = bgColor;
     this.ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
     // Draw gravestones
@@ -136,7 +217,6 @@ export class GameRenderer {
       else { eventSpeechOverrides.delete(id); }
     }
     this.spriteRenderer.setEventSpeech(activeSpeech);
-    this.spriteRenderer.setLineupMode(lineupActive);
 
     // Draw creatures
     for (const creature of creatures) {
@@ -177,39 +257,233 @@ export class GameRenderer {
     // Draw heal recovery effects
     this.renderHealEffects();
 
+    // Draw worsen effects (red flash)
+    this.renderWorsenEffects();
+
+    // Draw save sparkle effects (file saved → creature shines)
+    this.renderSaveEffects();
+
     // Draw interaction hearts between nearby creatures
     this.renderInteractionHearts(creatures);
 
     // Draw friendship indicators (Feature D: import-based relationships)
     this.renderFriendshipLinks(creatures, friendPairs);
 
-    // Draw weather overlay (part of the world)
+    // Draw weather overlay (bug-based)
     this.uiRenderer.renderWeatherOverlay(world.weather);
 
+    // Real weather overlay (from Open-Meteo — actual weather outside)
+    if (world.realWeather) {
+      this.renderRealWeatherOverlay(world.realWeather);
+    }
+
     this.ctx.restore();
+
+    // Time-of-day tint (screen-space, over the world but under UI)
+    this.renderTimeOfDayTint(world.timeOfDay);
+
+    // Space effects (screen-space, over the tint)
+    if (world.iss?.visible) {
+      this.renderISS();
+    }
+    this.renderShootingStars(world.neo?.count ?? 0);
 
     // === UI layer (fixed on screen, NOT affected by zoom & pan) ===
     this.uiRenderer.renderCreatureCount(creatures.length);
     this.uiRenderer.renderBugCount(bugCount);
+    this.uiRenderer.renderWeatherIndicator(world.realWeather, world.timeOfDay);
 
+    // Profile card: collapsed badge or full card (bottom-left, togglable)
     if (selectedCreatureId) {
       const selectedCreature = creatures.find(c => c.id === selectedCreatureId);
-      if (selectedCreature && selectedCreature.dna) {
-        this.uiRenderer.renderPersonality(selectedCreature.dna);
+      if (selectedCreature) {
+        if (this.profileCardOpen) {
+          this.uiRenderer.renderProfileCard(selectedCreature);
+        } else {
+          this.uiRenderer.renderProfileBadge(selectedCreature);
+        }
       }
     }
 
-    // Code health report (uses cached stats)
-    this.uiRenderer.renderHealthReport();
-
-    // Commit effect (UI layer)
+    // Commit celebration (UI layer)
     this.updateCommitEffect();
     if (this.commitEffectProgress > 0) {
-      this.uiRenderer.renderCommitEffect(this.commitEffectProgress);
+      this.renderFireworks();
+      this.uiRenderer.renderCommitEffect(this.commitEffectProgress, this.commitStreak, this.commitCombo);
     }
 
     // Farewell overlay (UI layer — screen dims, name floats away)
     this.renderFarewell();
+  }
+
+  /** Background color palette — shifts with the real-world clock */
+  private getTimeOfDayBackground(tod: TimeOfDay): string {
+    switch (tod) {
+      case 'dawn':      return '#F5E6D0'; // warm peach sunrise
+      case 'morning':   return '#F0F5E8'; // bright green-tinted daylight
+      case 'afternoon': return '#F5EDD8'; // warm golden afternoon
+      case 'dusk':      return '#E0D0C0'; // deep amber sunset
+      case 'night':     return '#1E1E2E'; // deep navy night
+      default:          return '#F0F5E8';
+    }
+  }
+
+  /** Subtle color tint over the entire scene — time-of-day atmosphere */
+  private renderTimeOfDayTint(tod: TimeOfDay): void {
+    if (tod === 'morning' || tod === 'afternoon') return; // no tint during day
+
+    this.ctx.save();
+    switch (tod) {
+      case 'dawn':
+        this.ctx.fillStyle = 'rgba(255, 180, 100, 0.06)'; // golden sunrise
+        break;
+      case 'dusk':
+        this.ctx.fillStyle = 'rgba(255, 120, 50, 0.08)'; // orange sunset
+        break;
+      case 'night':
+        this.ctx.fillStyle = 'rgba(20, 20, 60, 0.15)'; // blue moonlight
+        break;
+    }
+    this.ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+    // Night: add subtle stars
+    if (tod === 'night') {
+      this.ctx.fillStyle = '#FFFFFF';
+      const time = Date.now() / 2000;
+      for (let i = 0; i < 12; i++) {
+        const sx = (i * 41 + 13) % CANVAS_WIDTH;
+        const sy = (i * 29 + 7) % (CANVAS_HEIGHT * 0.4);
+        const twinkle = 0.2 + Math.sin(time + i * 1.7) * 0.15;
+        this.ctx.globalAlpha = twinkle;
+        this.ctx.beginPath();
+        this.ctx.arc(sx, sy, 0.8, 0, Math.PI * 2);
+        this.ctx.fill();
+      }
+    }
+
+    this.ctx.restore();
+  }
+
+  /** Real weather effects from Open-Meteo — blended with the code-health weather */
+  private renderRealWeatherOverlay(rw: RealWeather): void {
+    if (!rw || rw === 'clear') return;
+    const time = Date.now();
+
+    this.ctx.save();
+
+    if (rw === 'rain') {
+      // Dark sky tint
+      this.ctx.globalAlpha = 0.12;
+      this.ctx.fillStyle = '#1a1a2e';
+      this.ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+      // Rain clouds (dark, heavy)
+      this.ctx.globalAlpha = 0.5;
+      this.ctx.fillStyle = '#555';
+      this.drawRainCloud(20, 2, 90, 18);
+      this.drawRainCloud(130, 6, 80, 16);
+      this.drawRainCloud(260, 0, 100, 20);
+      this.drawRainCloud(380, 4, 70, 15);
+
+      // Raindrops — angled, streaky, layered
+      const t1 = time / 80;
+      // Heavy rain layer (fast, long streaks)
+      this.ctx.strokeStyle = '#7CB9E8';
+      this.ctx.lineWidth = 1.2;
+      this.ctx.globalAlpha = 0.45;
+      for (let i = 0; i < 50; i++) {
+        const rx = (i * 11.3 + t1 * 3.7) % (CANVAS_WIDTH + 40) - 20;
+        const ry = (i * 17.9 + t1 * 5.2) % CANVAS_HEIGHT;
+        this.ctx.beginPath();
+        this.ctx.moveTo(rx, ry);
+        this.ctx.lineTo(rx - 3, ry + 12);
+        this.ctx.stroke();
+      }
+      // Light rain layer (slow, short streaks, faint)
+      this.ctx.lineWidth = 0.8;
+      this.ctx.globalAlpha = 0.25;
+      for (let i = 0; i < 30; i++) {
+        const rx = (i * 19.7 + t1 * 2.1) % (CANVAS_WIDTH + 20) - 10;
+        const ry = (i * 23.3 + t1 * 3.8) % CANVAS_HEIGHT;
+        this.ctx.beginPath();
+        this.ctx.moveTo(rx, ry);
+        this.ctx.lineTo(rx - 2, ry + 8);
+        this.ctx.stroke();
+      }
+
+      // Splash particles at bottom
+      this.ctx.globalAlpha = 0.3;
+      this.ctx.fillStyle = '#7CB9E8';
+      for (let i = 0; i < 8; i++) {
+        const sx = (i * 61 + time * 0.05) % CANVAS_WIDTH;
+        const splash = Math.sin(time / 200 + i * 2.3) * 0.5 + 0.5;
+        if (splash > 0.7) {
+          const sy = CANVAS_HEIGHT - 10 - Math.random() * 5;
+          this.ctx.beginPath();
+          this.ctx.arc(sx, sy, 1.5, 0, Math.PI * 2);
+          this.ctx.fill();
+          // Tiny splash lines
+          this.ctx.strokeStyle = '#7CB9E8';
+          this.ctx.lineWidth = 0.5;
+          this.ctx.beginPath();
+          this.ctx.moveTo(sx - 3, sy);
+          this.ctx.lineTo(sx - 5, sy - 3);
+          this.ctx.moveTo(sx + 3, sy);
+          this.ctx.lineTo(sx + 5, sy - 3);
+          this.ctx.stroke();
+        }
+      }
+    } else if (rw === 'cloudy') {
+      // Overcast tint
+      this.ctx.globalAlpha = 0.06;
+      this.ctx.fillStyle = '#666';
+      this.ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+      // Drifting clouds
+      this.ctx.globalAlpha = 0.35;
+      this.ctx.fillStyle = '#999';
+      const drift = time * 0.005;
+      this.drawRainCloud((40 + drift) % (CANVAS_WIDTH + 100) - 50, 5, 90, 18);
+      this.drawRainCloud((180 + drift * 0.7) % (CANVAS_WIDTH + 100) - 50, 10, 80, 16);
+      this.drawRainCloud((320 + drift * 1.2) % (CANVAS_WIDTH + 100) - 50, 2, 100, 20);
+    } else if (rw === 'snow') {
+      // Gentle snowflakes
+      this.ctx.fillStyle = '#FFFFFF';
+      this.ctx.globalAlpha = 0.6;
+      for (let i = 0; i < 20; i++) {
+        const x = (i * 27 + time * 0.02) % CANVAS_WIDTH;
+        const y = (i * 19 + time * 0.03) % CANVAS_HEIGHT;
+        const size = 1 + (i % 3) * 0.5;
+        this.ctx.beginPath();
+        this.ctx.arc(x, y, size, 0, Math.PI * 2);
+        this.ctx.fill();
+      }
+    } else if (rw === 'fog') {
+      // Soft fog bands
+      this.ctx.globalAlpha = 0.08;
+      this.ctx.fillStyle = '#CCCCCC';
+      const drift = Math.sin(time / 5000) * 20;
+      this.ctx.fillRect(0, CANVAS_HEIGHT * 0.3 + drift, CANVAS_WIDTH, 40);
+      this.ctx.fillRect(0, CANVAS_HEIGHT * 0.6 - drift, CANVAS_WIDTH, 30);
+    }
+
+    this.ctx.restore();
+  }
+
+  /** Rounded cloud shape for rain/cloudy overlays */
+  private drawRainCloud(x: number, y: number, w: number, h: number): void {
+    this.ctx.beginPath();
+    // Cloud: overlapping ellipses
+    const cx = x + w / 2;
+    const cy = y + h / 2;
+    this.ctx.ellipse(cx, cy, w / 2, h / 2, 0, 0, Math.PI * 2);
+    this.ctx.fill();
+    this.ctx.beginPath();
+    this.ctx.ellipse(cx - w * 0.25, cy - h * 0.15, w * 0.3, h * 0.4, 0, 0, Math.PI * 2);
+    this.ctx.fill();
+    this.ctx.beginPath();
+    this.ctx.ellipse(cx + w * 0.2, cy - h * 0.1, w * 0.35, h * 0.45, 0, 0, Math.PI * 2);
+    this.ctx.fill();
   }
 
   private renderChatBubble(x: number, y: number, message: string): void {
@@ -319,6 +593,100 @@ export class GameRenderer {
     }
 
     this.ctx.setLineDash([]);
+    this.ctx.restore();
+  }
+
+  /** Render ISS crossing the sky — small satellite sprite moving left to right */
+  private renderISS(): void {
+    const speed = 0.4; // pixels per frame
+    this.issX += speed;
+    if (this.issX > CANVAS_WIDTH + 40) {
+      this.issX = -40; // loop back
+    }
+
+    const y = 20 + Math.sin(this.issX / 80) * 8; // gentle wave
+
+    this.ctx.save();
+    this.ctx.globalAlpha = 0.9;
+
+    // ISS body (small satellite shape)
+    this.ctx.fillStyle = '#E0E0E0';
+    this.ctx.fillRect(this.issX - 4, y - 1, 8, 3); // body
+    // Solar panels
+    this.ctx.fillStyle = '#4FC3F7';
+    this.ctx.fillRect(this.issX - 10, y - 1, 5, 2); // left panel
+    this.ctx.fillRect(this.issX + 5, y - 1, 5, 2);  // right panel
+
+    // Glow trail
+    this.ctx.globalAlpha = 0.3;
+    this.ctx.fillStyle = '#FFFFFF';
+    for (let i = 1; i <= 3; i++) {
+      this.ctx.globalAlpha = 0.3 - i * 0.08;
+      this.ctx.fillRect(this.issX - 4 - i * 6, y, 4, 1);
+    }
+
+    this.ctx.restore();
+  }
+
+  /** Render shooting stars — frequency driven by today's near-Earth asteroid count */
+  private renderShootingStars(neoCount: number): void {
+    if (neoCount === 0) return;
+
+    const now = Date.now();
+    // Spawn rate: more asteroids = more shooting stars (1 every 3-8 seconds)
+    const spawnInterval = Math.max(3000, 10000 - neoCount * 500);
+    if (now - this.lastShootingStarSpawn > spawnInterval) {
+      this.lastShootingStarSpawn = now;
+      const startX = Math.random() * CANVAS_WIDTH;
+      this.shootingStars.push({
+        x: startX,
+        y: Math.random() * 40, // start near top
+        vx: 2 + Math.random() * 3,
+        vy: 1 + Math.random() * 2,
+        life: 800 + Math.random() * 600,
+        born: now,
+        length: 15 + Math.random() * 25,
+      });
+    }
+
+    this.ctx.save();
+    // Update and render
+    this.shootingStars = this.shootingStars.filter(s => {
+      const age = now - s.born;
+      if (age > s.life) return false;
+
+      const progress = age / s.life;
+      const alpha = progress < 0.3 ? progress / 0.3 : 1 - (progress - 0.3) / 0.7;
+
+      s.x += s.vx;
+      s.y += s.vy;
+
+      // Draw the streak
+      this.ctx.globalAlpha = alpha * 0.8;
+      const gradient = this.ctx.createLinearGradient(
+        s.x, s.y, s.x - s.vx * s.length / 3, s.y - s.vy * s.length / 3
+      );
+      gradient.addColorStop(0, '#FFFFFF');
+      gradient.addColorStop(0.5, '#FFD700');
+      gradient.addColorStop(1, 'rgba(255,215,0,0)');
+
+      this.ctx.strokeStyle = gradient;
+      this.ctx.lineWidth = 1.5;
+      this.ctx.beginPath();
+      this.ctx.moveTo(s.x, s.y);
+      this.ctx.lineTo(s.x - s.vx * s.length / 3, s.y - s.vy * s.length / 3);
+      this.ctx.stroke();
+
+      // Bright head
+      this.ctx.globalAlpha = alpha;
+      this.ctx.fillStyle = '#FFFFFF';
+      this.ctx.beginPath();
+      this.ctx.arc(s.x, s.y, 1.5, 0, Math.PI * 2);
+      this.ctx.fill();
+
+      return true;
+    });
+
     this.ctx.restore();
   }
 
@@ -463,6 +831,123 @@ export class GameRenderer {
     }
   }
 
+  private renderWorsenEffects(): void {
+    const now = Date.now();
+    this.worsenEffects = this.worsenEffects.filter(e => now - e.startTime < this.WORSEN_EFFECT_DURATION);
+
+    for (const effect of this.worsenEffects) {
+      const elapsed = now - effect.startTime;
+      const progress = elapsed / this.WORSEN_EFFECT_DURATION;
+
+      this.ctx.save();
+
+      // Phase 1: Red flash ring (0-0.3)
+      if (progress < 0.3) {
+        const p = progress / 0.3;
+        const radius = 6 + p * 16;
+        this.ctx.globalAlpha = (1 - p) * 0.8;
+        this.ctx.strokeStyle = '#EF5350';
+        this.ctx.lineWidth = 2.5 - p * 2;
+        this.ctx.beginPath();
+        this.ctx.arc(effect.x, effect.y, radius, 0, Math.PI * 2);
+        this.ctx.stroke();
+      }
+
+      // Phase 2: Red particles scatter outward (0.1-0.8)
+      if (progress > 0.1 && progress < 0.8) {
+        const sparkAlpha = progress < 0.3 ? (progress - 0.1) / 0.2 : (0.8 - progress) / 0.5;
+        this.ctx.globalAlpha = sparkAlpha * 0.7;
+        this.ctx.fillStyle = '#EF9A9A';
+        for (let i = 0; i < 6; i++) {
+          const angle = (i / 6) * Math.PI * 2 + elapsed * 0.004;
+          const r = 8 + progress * 22;
+          const px = effect.x + Math.cos(angle) * r;
+          const py = effect.y + Math.sin(angle) * r * 0.6;
+          this.ctx.beginPath();
+          this.ctx.arc(px, py, 1.5, 0, Math.PI * 2);
+          this.ctx.fill();
+        }
+      }
+
+      // Phase 3: Dim red glow (0.3-1.0)
+      if (progress > 0.3) {
+        const glowAlpha = (1 - progress) * 0.2;
+        this.ctx.globalAlpha = glowAlpha;
+        const gradient = this.ctx.createRadialGradient(effect.x, effect.y, 0, effect.x, effect.y, 20);
+        gradient.addColorStop(0, '#FFCDD2');
+        gradient.addColorStop(1, 'transparent');
+        this.ctx.fillStyle = gradient;
+        this.ctx.beginPath();
+        this.ctx.arc(effect.x, effect.y, 20, 0, Math.PI * 2);
+        this.ctx.fill();
+      }
+
+      this.ctx.restore();
+    }
+  }
+
+  /** File-save sparkle — a quick golden twinkle when a file is saved */
+  private renderSaveEffects(): void {
+    const now = Date.now();
+    this.saveEffects = this.saveEffects.filter(e => now - e.startTime < this.SAVE_EFFECT_DURATION);
+
+    for (const effect of this.saveEffects) {
+      const elapsed = now - effect.startTime;
+      const progress = elapsed / this.SAVE_EFFECT_DURATION;
+      this.ctx.save();
+
+      // Phase 1 (0→0.3): Quick white flash ring
+      if (progress < 0.3) {
+        const ringProgress = progress / 0.3;
+        const radius = 4 + ringProgress * 14;
+        this.ctx.globalAlpha = (1 - ringProgress) * 0.7;
+        this.ctx.strokeStyle = '#FFFFFF';
+        this.ctx.lineWidth = 2 - ringProgress * 1.5;
+        this.ctx.beginPath();
+        this.ctx.arc(effect.x, effect.y, radius, 0, Math.PI * 2);
+        this.ctx.stroke();
+      }
+
+      // Phase 2 (0.1→0.8): Golden sparkle particles radiating out
+      if (progress > 0.1 && progress < 0.8) {
+        const sparkleProgress = (progress - 0.1) / 0.7;
+        this.ctx.globalAlpha = (1 - sparkleProgress) * 0.8;
+        const colors = ['#FFD700', '#FFF176', '#FFEB3B', '#FFE082'];
+        for (let i = 0; i < 8; i++) {
+          const angle = (i / 8) * Math.PI * 2 + progress * 3;
+          const dist = 5 + sparkleProgress * 18;
+          const sx = effect.x + Math.cos(angle) * dist;
+          const sy = effect.y + Math.sin(angle) * dist;
+          this.ctx.fillStyle = colors[i % colors.length];
+          // Star-shaped sparkle
+          const size = (1 - sparkleProgress) * 2.5;
+          this.ctx.beginPath();
+          this.ctx.arc(sx, sy, size, 0, Math.PI * 2);
+          this.ctx.fill();
+        }
+      }
+
+      // Phase 3 (0→0.5): Soft golden glow under creature
+      if (progress < 0.5) {
+        const glowAlpha = (1 - progress / 0.5) * 0.2;
+        this.ctx.globalAlpha = glowAlpha;
+        const gradient = this.ctx.createRadialGradient(effect.x, effect.y, 0, effect.x, effect.y, 16);
+        gradient.addColorStop(0, '#FFD700');
+        gradient.addColorStop(1, 'transparent');
+        this.ctx.fillStyle = gradient;
+        this.ctx.beginPath();
+        this.ctx.arc(effect.x, effect.y, 16, 0, Math.PI * 2);
+        this.ctx.fill();
+      }
+
+      this.ctx.restore();
+    }
+  }
+
+  /**
+   * Farewell scene — "仲間が離脱する時、プレイヤーは本当に泣く" — 堀井雄二
+   * Extended 5s animation: slow dim → name rises → particles scatter → fade to light
+   */
   private renderFarewell(): void {
     if (!this.farewellName) return;
     const elapsed = Date.now() - this.farewellStart;
@@ -472,44 +957,124 @@ export class GameRenderer {
     }
 
     const progress = elapsed / this.FAREWELL_DURATION;
+    const cx = CANVAS_WIDTH / 2;
 
     this.ctx.save();
 
-    // Dim overlay — peaks at 0.3, then fades
-    const dimAlpha = progress < 0.2 ? progress / 0.2 * 0.4 :
-                     progress < 0.6 ? 0.4 :
-                     0.4 * (1 - (progress - 0.6) / 0.4);
+    // Phase 1 (0→0.15): Slow dim — the world pauses
+    // Phase 2 (0.15→0.7): Name floats up with light particles
+    // Phase 3 (0.7→1.0): Everything fades to soft light, then clears
+
+    // Dim overlay — slow in, hold, gentle out
+    const dimAlpha = progress < 0.15 ? progress / 0.15 * 0.5 :
+                     progress < 0.7 ? 0.5 :
+                     0.5 * (1 - (progress - 0.7) / 0.3);
     this.ctx.fillStyle = `rgba(10, 10, 30, ${dimAlpha})`;
     this.ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
-    // Name floats upward from center and fades
-    const textAlpha = progress < 0.15 ? progress / 0.15 :
-                      progress > 0.7 ? (1 - progress) / 0.3 : 1;
-    const floatY = CANVAS_HEIGHT / 2 - progress * 30;
+    // Name floats upward slowly
+    const textAlpha = progress < 0.1 ? progress / 0.1 :
+                      progress > 0.8 ? (1 - progress) / 0.2 : 1;
+    const floatY = CANVAS_HEIGHT / 2 - progress * 40;
 
     this.ctx.globalAlpha = textAlpha;
     this.ctx.textAlign = 'center';
 
-    // Name
-    this.ctx.font = 'bold 14px sans-serif';
-    this.ctx.fillStyle = '#FFFFFF';
-    this.ctx.fillText(this.farewellName, CANVAS_WIDTH / 2, floatY);
+    // "Goodbye" text (small, above the name)
+    if (progress > 0.1 && progress < 0.85) {
+      this.ctx.font = '10px sans-serif';
+      this.ctx.fillStyle = '#90A4AE';
+      const goodbyeAlpha = progress < 0.2 ? (progress - 0.1) / 0.1 :
+                           progress > 0.75 ? (0.85 - progress) / 0.1 : 1;
+      this.ctx.globalAlpha = goodbyeAlpha * 0.7;
+      this.ctx.fillText('goodbye...', cx, floatY - 16);
+    }
 
-    // Subtle dotted line below (like a gentle wave goodbye)
-    if (progress > 0.2 && progress < 0.8) {
-      const lineAlpha = textAlpha * 0.4;
+    // Name — larger, with soft glow
+    this.ctx.globalAlpha = textAlpha;
+    this.ctx.shadowColor = '#FFFFFF';
+    this.ctx.shadowBlur = 8;
+    this.ctx.font = 'bold 16px sans-serif';
+    this.ctx.fillStyle = '#FFFFFF';
+    this.ctx.fillText(this.farewellName, cx, floatY);
+    this.ctx.shadowBlur = 0;
+
+    // Light particles rising from where the name is (like the spirit departing)
+    if (progress > 0.15 && progress < 0.9) {
+      const particleProgress = (progress - 0.15) / 0.75;
+      const particleAlpha = (1 - particleProgress) * 0.6;
+      this.ctx.globalAlpha = particleAlpha;
+      this.ctx.fillStyle = '#E0E0E0';
+      for (let i = 0; i < 10; i++) {
+        const angle = (i / 10) * Math.PI * 2 + progress * 2;
+        const dist = 10 + particleProgress * 50 + Math.sin(i * 3.7) * 15;
+        const px = cx + Math.cos(angle) * dist;
+        const py = floatY + Math.sin(angle) * dist * 0.5 - particleProgress * 30;
+        const size = (1 - particleProgress) * 1.5;
+        this.ctx.beginPath();
+        this.ctx.arc(px, py, size, 0, Math.PI * 2);
+        this.ctx.fill();
+      }
+    }
+
+    // Subtle dotted line (a gentle wave goodbye)
+    if (progress > 0.2 && progress < 0.75) {
+      const lineAlpha = textAlpha * 0.3;
       this.ctx.globalAlpha = lineAlpha;
       this.ctx.strokeStyle = '#FFFFFF';
       this.ctx.lineWidth = 0.5;
       this.ctx.setLineDash([2, 4]);
       this.ctx.beginPath();
-      const lineW = 40;
-      this.ctx.moveTo(CANVAS_WIDTH / 2 - lineW, floatY + 8);
-      this.ctx.lineTo(CANVAS_WIDTH / 2 + lineW, floatY + 8);
+      const lineW = 50 + progress * 20;
+      this.ctx.moveTo(cx - lineW, floatY + 12);
+      this.ctx.lineTo(cx + lineW, floatY + 12);
       this.ctx.stroke();
       this.ctx.setLineDash([]);
     }
 
+    // Phase 3: Soft white fade at the very end (returning to the world of light)
+    if (progress > 0.85) {
+      const fadeAlpha = (progress - 0.85) / 0.15 * 0.3;
+      this.ctx.globalAlpha = fadeAlpha;
+      this.ctx.fillStyle = '#FFFFFF';
+      this.ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    }
+
+    this.ctx.restore();
+  }
+
+  private renderFireworks(): void {
+    const now = Date.now();
+    this.fireworks = this.fireworks.filter(f => now - f.born < f.life);
+
+    this.ctx.save();
+    for (const f of this.fireworks) {
+      const age = now - f.born;
+      const t = age / f.life;
+
+      // Update position with gravity
+      f.x += f.vx;
+      f.y += f.vy;
+      f.vy += 0.04; // gravity
+      f.vx *= 0.99; // drag
+
+      this.ctx.globalAlpha = (1 - t) * 0.8;
+      this.ctx.fillStyle = f.color;
+
+      // Particles shrink and leave a trail
+      const size = (1 - t) * 2.5;
+      this.ctx.beginPath();
+      this.ctx.arc(f.x, f.y, Math.max(0.3, size), 0, Math.PI * 2);
+      this.ctx.fill();
+
+      // Sparkle trail
+      if (t < 0.5) {
+        this.ctx.globalAlpha = (0.5 - t) * 0.4;
+        this.ctx.beginPath();
+        this.ctx.arc(f.x - f.vx * 2, f.y - f.vy * 2, size * 0.5, 0, Math.PI * 2);
+        this.ctx.fill();
+      }
+    }
     this.ctx.restore();
   }
 

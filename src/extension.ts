@@ -1,17 +1,19 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs';
 import * as path from 'path';
 import { PanelProvider } from './ui/PanelProvider';
 import { MonitorManager } from './monitor/MonitorManager';
 import { CreatureManager } from './creature/CreatureManager';
 import { CreatureStorage } from './storage/CreatureStorage';
-import { createInitialWorldState, updateWeather, setBugsInWorld, addGraveStone } from './world/WorldState';
-import { getSpeciesForFile } from './creature/SpeciesData';
+import { createInitialWorldState, updateWeather, setBugsInWorld, addGraveStone, clearGraveStones, updateTimeOfDay, updateRealWeather, updateISS, updateNEO, getTimeOfDay } from './world/WorldState';
+import { getSpeciesForFile, loadCustomSpeciesMap } from './creature/SpeciesData';
 import { DNAAnalyzer, defaultDNA } from './creature/DNAAnalyzer';
 import { WorldData, ExtToWebMessage, WebToExtMessage, AgentType, CodingDNA, FileHealth, CreatureData } from './types';
-import { MAX_CREATURES, CANVAS_WIDTH, CANVAS_HEIGHT } from './constants';
+import { MAX_CREATURES, MS_PER_DAY, NESTING_THRESHOLD, FUNCTION_LENGTH_THRESHOLD, LINE_COUNT_HEAVY, LINE_COUNT_OBESE, STALE_DAYS } from './constants';
 import { AgentManager } from './agent/AgentManager';
 import { getPersonality, pickSpeech, SpeechEvent } from './ai/SpeechTemplates';
 import { analyzeFriendships } from './monitor/ImportAnalyzer';
+import { ApiService } from './services/ApiService';
 
 const TICK_INTERVAL = 200; // ms
 
@@ -42,52 +44,141 @@ export function activate(context: vscode.ExtensionContext): void {
   const creatureManager = new CreatureManager();
   const agentManager = new AgentManager();
 
+  // Load custom config from .digital-life.json
+  try {
+    const configRaw = fs.readFileSync(path.join(workspacePath, '.digital-life.json'), 'utf-8');
+    const config = JSON.parse(configRaw) as Record<string, unknown>;
+    if (config.speciesMap) { loadCustomSpeciesMap(config.speciesMap as Record<string, string>); }
+  } catch { /* no config file or invalid JSON — use defaults */ }
+
   // Direct terminal references — the ONLY source of truth for agent→terminal mapping
   const agentTerminals: Map<string, vscode.Terminal> = new Map();
   const outputChannel = vscode.window.createOutputChannel('Digital Life');
   outputChannel.appendLine(`[Digital Life] Extension activated at ${new Date().toISOString()}`);
   outputChannel.show(true);
+  const apiService = new ApiService(outputChannel);
   let worldState: WorldData;
 
   // Restore state
   const savedState = storage.load();
   let isFirstRun = false;
   if (savedState) {
-    creatureManager.loadCreatures(savedState.creatures);
-    worldState = savedState.world;
-    // Don't restore saved agents - start fresh each session
+    // Backfill new creature fields for saved states from older versions
+    const backfilledCreatures = savedState.creatures.map(c => ({
+      ...c,
+      mutation: 'mutation' in c ? c.mutation : null,
+      neglectWarned: 'neglectWarned' in c ? c.neglectWarned : false,
+    }));
+    creatureManager.loadCreatures(backfilledCreatures);
+    // Backfill new WorldData fields for saved states from older versions
+    worldState = {
+      ...savedState.world,
+      timeOfDay: savedState.world.timeOfDay ?? getTimeOfDay(),
+      realWeather: savedState.world.realWeather ?? null,
+    };
   } else {
     worldState = createInitialWorldState();
     isFirstRun = true;
   }
 
+  // Daily stats tracking
+  const dailyStats = {
+    date: new Date().toDateString(),
+    commits: 0,
+    bugsFixed: 0,
+    levelUps: 0,
+    notificationsShown: 0,
+  };
+
+  const MAX_DAILY_NOTIFICATIONS = 3;
+
+  function resetDailyStatsIfNeeded(): void {
+    const today = new Date().toDateString();
+    if (dailyStats.date !== today) {
+      dailyStats.date = today;
+      dailyStats.commits = 0;
+      dailyStats.bugsFixed = 0;
+      dailyStats.levelUps = 0;
+      dailyStats.notificationsShown = 0;
+    }
+  }
+
+  /** Show a VS Code notification if under the daily limit */
+  function showThrottledNotification(
+    type: 'warning' | 'error' | 'info',
+    message: string,
+    ...actions: string[]
+  ): Thenable<string | undefined> | undefined {
+    resetDailyStatsIfNeeded();
+    if (dailyStats.notificationsShown >= MAX_DAILY_NOTIFICATIONS) return undefined;
+    dailyStats.notificationsShown++;
+    switch (type) {
+      case 'warning': return vscode.window.showWarningMessage(message, ...actions);
+      case 'error': return vscode.window.showErrorMessage(message, ...actions);
+      default: return vscode.window.showInformationMessage(message, ...actions);
+    }
+  }
+
   // Status bar item — always visible feedback
   const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
-  statusBarItem.command = 'digitalLife.adoptFiles';
+  statusBarItem.command = 'digitalLife.focusWeakest';
   statusBarItem.show();
   context.subscriptions.push(statusBarItem);
 
   function updateStatusBar(): void {
     const all = creatureManager.getAll();
     const count = all.length;
-    const hungry = all.filter(c => c.stage !== 'egg' && c.hunger < 30).length;
-    const sick = all.filter(c => c.fileHealth.bugCount > 0).length;
 
     if (count === 0) {
-      statusBarItem.text = 'Digital Life';
+      statusBarItem.text = '\u{1F331} Digital Life';
       statusBarItem.tooltip = 'Click to adopt files as friends';
       return;
     }
 
-    // Emotional status — the most urgent feeling wins
-    if (hungry > 0) {
-      statusBarItem.text = `${count} friends -- ${hungry} hungry`;
-    } else if (sick > 0) {
-      statusBarItem.text = `${count} friends -- ${sick} not well`;
-    } else {
-      statusBarItem.text = `${count} friends -- all good`;
+    const active = all.filter(c => c.stage !== 'egg');
+
+    // Find the creature that needs the most attention
+    let urgentName = '';
+    let urgentMsg = '';
+    let urgentPriority = 0;
+
+    for (const c of active) {
+      const h = c.fileHealth;
+      if (c.hunger < 15 && urgentPriority < 5) {
+        urgentPriority = 5;
+        urgentName = c.name;
+        urgentMsg = '\u{1F4A8} starving...';
+      } else if (c.hunger < 30 && urgentPriority < 4) {
+        urgentPriority = 4;
+        urgentName = c.name;
+        urgentMsg = '\u{1F37D}\uFE0F hungry';
+      } else if (h.bugCount > 3 && urgentPriority < 3) {
+        urgentPriority = 3;
+        urgentName = c.name;
+        urgentMsg = '\u{1F912} very sick';
+      } else if (h.bugCount > 0 && urgentPriority < 2) {
+        urgentPriority = 2;
+        urgentName = c.name;
+        urgentMsg = '\u{1F915} not well';
+      } else if ((h.maxNesting ?? 0) > NESTING_THRESHOLD && urgentPriority < 1) {
+        urgentPriority = 1;
+        urgentName = c.name;
+        urgentMsg = '\u{1F635} tangled';
+      }
     }
-    statusBarItem.tooltip = `Digital Life: ${count} friends`;
+
+    // Daily summary for tooltip
+    resetDailyStatsIfNeeded();
+    const dailySummary = `Today: ${dailyStats.commits} commits, ${dailyStats.bugsFixed} bugs fixed, ${dailyStats.levelUps} level ups`;
+
+    if (urgentName) {
+      statusBarItem.text = `\u{1F33F} ${urgentName} ${urgentMsg}`;
+      const happy = active.filter(c => c.hunger >= 30 && c.fileHealth.bugCount === 0).length;
+      statusBarItem.tooltip = `Digital Life: ${count} friends \u2014 ${happy} happy, ${count - happy} need care\n${dailySummary}`;
+    } else {
+      statusBarItem.text = `\u{1F33F} ${count} friends \u2014 all good \u2728`;
+      statusBarItem.tooltip = `Digital Life: ${count} friends \u2014 everyone is happy!\n${dailySummary}`;
+    }
   }
 
   updateStatusBar();
@@ -157,8 +248,9 @@ export function activate(context: vscode.ExtensionContext): void {
 
   /** Periodically broadcast time-of-day speech (every 30 minutes) */
   let lastTimeSlot = '';
+  let timeOfDayTimer: ReturnType<typeof setInterval> | null = null;
   function startTimeOfDayTimer(): void {
-    setInterval(() => {
+    timeOfDayTimer = setInterval(() => {
       const event = getTimeOfDaySpeechEvent();
       if (event !== lastTimeSlot) {
         lastTimeSlot = event;
@@ -209,16 +301,16 @@ export function activate(context: vscode.ExtensionContext): void {
     const candidates = creatureManager.getAll().filter(c => {
       if (c.stage === 'egg') return false;
       const h = c.fileHealth;
-      const daysSince = (now - h.lastModified) / 864e5;
-      return h.bugCount >= 3 || h.lineCount > 400 || daysSince > 5;
+      const daysSince = (now - h.lastModified) / MS_PER_DAY;
+      return h.bugCount >= 3 || h.lineCount > LINE_COUNT_OBESE || daysSince > STALE_DAYS + 2;
     });
 
     if (candidates.length === 0) return;
 
     // Pick the worst-off creature
     const worst = candidates.sort((a, b) => {
-      const scoreA = a.fileHealth.bugCount * 10 + (a.fileHealth.lineCount > 400 ? 5 : 0);
-      const scoreB = b.fileHealth.bugCount * 10 + (b.fileHealth.lineCount > 400 ? 5 : 0);
+      const scoreA = a.fileHealth.bugCount * 10 + (a.fileHealth.lineCount > LINE_COUNT_OBESE ? 5 : 0);
+      const scoreB = b.fileHealth.bugCount * 10 + (b.fileHealth.lineCount > LINE_COUNT_OBESE ? 5 : 0);
       return scoreB - scoreA;
     })[0];
 
@@ -233,7 +325,7 @@ export function activate(context: vscode.ExtensionContext): void {
       description = speechLang === 'ja'
         ? `バグが${h.bugCount}個...お薬をあげますか？`
         : `${h.bugCount} bugs making them sick... give medicine?`;
-    } else if (h.lineCount > 400) {
+    } else if (h.lineCount > LINE_COUNT_OBESE) {
       action = 'diet';
       description = speechLang === 'ja'
         ? `${h.lineCount}行もあって重そう...ダイエットさせますか？`
@@ -261,77 +353,46 @@ export function activate(context: vscode.ExtensionContext): void {
     lastSuggestionTime = now;
   }
 
-  // ── Feature C: Morning Briefing ──────────────────────────────
+  // ── Feature C: Morning Wake-up (creature-driven, no AI narrator) ──
   let morningSent = false;
 
-  function sendMorningDiary(): void {
+  function sendMorningWakeUp(): void {
     if (morningSent) return;
     morningSent = true;
 
     const all = creatureManager.getAll().filter(c => c.stage !== 'egg');
     if (all.length === 0) return;
 
-    // Collect health stats across all creatures
-    const sickCreatures: { name: string; bugs: number }[] = [];
-    const tiredCreatures: { name: string; days: number }[] = [];
-    const heavyCreatures: { name: string; lines: number }[] = [];
-    let totalBugs = 0;
+    // Find the creature that needs the most help (worst health first)
+    let worstCreature: CreatureData | null = null;
+    let worstScore = Infinity;
 
     for (const c of all) {
       const h = c.fileHealth;
-      const daysSince = Math.floor((Date.now() - h.lastModified) / 864e5);
-      totalBugs += h.bugCount;
-      if (h.bugCount > 0) { sickCreatures.push({ name: c.name, bugs: h.bugCount }); }
-      if (daysSince > 3) { tiredCreatures.push({ name: c.name, days: daysSince }); }
-      if (h.lineCount > 300) { heavyCreatures.push({ name: c.name, lines: h.lineCount }); }
-    }
+      const daysSince = (Date.now() - h.lastModified) / MS_PER_DAY;
+      // Lower score = worse health
+      let score = 100;
+      if (h.bugCount > 0) score -= h.bugCount * 20;
+      if (h.lineCount > LINE_COUNT_HEAVY) score -= 30;
+      if ((h.maxNesting ?? 0) > NESTING_THRESHOLD) score -= 25;
+      if ((h.longestFunction ?? 0) > FUNCTION_LENGTH_THRESHOLD) score -= 20;
+      if (daysSince > STALE_DAYS) score -= 20;
+      score -= (100 - c.hunger) * 0.3;
 
-    const unhealthyCount = sickCreatures.length + tiredCreatures.length + heavyCreatures.length;
-
-    // Build briefing message
-    let entry: string;
-    const hour = new Date().getHours();
-    const greeting = hour < 12 ? (speechLang === 'ja' ? 'おはようございます' : 'Good morning')
-                   : hour < 18 ? (speechLang === 'ja' ? 'こんにちは' : 'Good afternoon')
-                   : (speechLang === 'ja' ? 'こんばんは' : 'Good evening');
-
-    if (speechLang === 'ja') {
-      if (unhealthyCount === 0) {
-        entry = `${greeting}！みんな元気です！${all.length}体の子たちが待ってましたよ`;
-      } else {
-        const parts: string[] = [];
-        if (sickCreatures.length > 0) {
-          parts.push(`${sickCreatures.length}体がバグで体調悪いみたい`);
-        }
-        if (tiredCreatures.length > 0) {
-          parts.push(`${tiredCreatures.length}体がしばらく触ってもらえてない`);
-        }
-        if (heavyCreatures.length > 0) {
-          parts.push(`${heavyCreatures.length}体がちょっと重そう`);
-        }
-        entry = `${greeting}！${parts.join('、')}。見てあげますか？`;
-      }
-    } else {
-      if (unhealthyCount === 0) {
-        entry = `${greeting}! Everyone is healthy! ${all.length} friends are waiting for you`;
-      } else {
-        const parts: string[] = [];
-        if (sickCreatures.length > 0) {
-          parts.push(`${sickCreatures.length} feeling sick (bugs)`);
-        }
-        if (tiredCreatures.length > 0) {
-          parts.push(`${tiredCreatures.length} feeling lonely (untouched)`);
-        }
-        if (heavyCreatures.length > 0) {
-          parts.push(`${heavyCreatures.length} feeling heavy (large files)`);
-        }
-        entry = `${greeting}! ${parts.join(', ')}. Want to check on them?`;
+      if (score < worstScore) {
+        worstScore = score;
+        worstCreature = c;
       }
     }
 
-    // Send as diary to the first creature (it speaks on behalf of all)
-    const creature = all[0];
-    panelProvider.postMessage({ type: 'diary', creatureId: creature.id, entry });
+    // Let creatures speak for themselves via their existing mood bubbles.
+    // If there's a creature in trouble, nudge the user toward it.
+    if (worstCreature && worstScore < 70) {
+      panelProvider.postMessage({
+        type: 'nudgeCreature',
+        creatureId: worstCreature.id,
+      });
+    }
   }
 
   // Monitor manager
@@ -355,6 +416,11 @@ export function activate(context: vscode.ExtensionContext): void {
       const savedCreatureId = creatureManager.getByFile(filePath);
       if (savedCreatureId) {
         broadcastSpeech('save', savedCreatureId);
+        // Save sparkle — golden twinkle on the affected creature
+        const config = vscode.workspace.getConfiguration('digitalLife');
+        if (config.get<boolean>('saveReaction', true)) {
+          panelProvider.postMessage({ type: 'fileSaved', creatureId: savedCreatureId });
+        }
       }
       // Bug count is updated via onBugCountChanged
       // If any agent is running, briefly show generating status
@@ -385,22 +451,42 @@ export function activate(context: vscode.ExtensionContext): void {
           creature.position,
         );
         panelProvider.postMessage({ type: 'creatureDied', creatureId: creature.id, creatureName: creature.name });
-        sendWorldUpdate();
-        saveState();
+        syncAndSave();
       }
     },
     onCommitDetected: (_sha: string) => {
+      resetDailyStatsIfNeeded();
+      dailyStats.commits++;
       creatureManager.feedAll();
       const leveledUp = creatureManager.commitBonus();
       worldState = updateWeather(worldState, 0);
-      panelProvider.postMessage({ type: 'commitDetected' });
+
+      // Fetch commit streak asynchronously, then send celebration
+      void monitorManager.getCommitStreak().then(streak => {
+        panelProvider.postMessage({
+          type: 'commitDetected',
+          stats: { insertions: 0, deletions: 0, filesChanged: 0, streak },
+        });
+
+        // Update streak in status bar
+        if (streak >= 7) {
+          const tier = streak >= 100 ? '\u{1F525}' : streak >= 30 ? '\u{1F3C6}' : '\u2B50';
+          statusBarItem.text = `\u{1F33F} ${tier} ${streak}-day streak!`;
+        }
+      });
+
       for (const id of leveledUp) {
+        dailyStats.levelUps++;
         panelProvider.postMessage({ type: 'levelUp', creatureId: id });
-        broadcastSpeech('levelUp', id); // Feature A: living words on level up
+        broadcastSpeech('levelUp', id);
+        // Check if mutation was unlocked
+        const leveledCreature = creatureManager.getById(id);
+        if (leveledCreature?.mutation) {
+          panelProvider.postMessage({ type: 'mutationUnlocked', creatureId: id, mutation: leveledCreature.mutation });
+        }
       }
-      broadcastSpeech('commit'); // Feature A: living words on commit
-      sendWorldUpdate();
-      saveState();
+      broadcastSpeech('commit');
+      syncAndSave();
       void dnaAnalyzer.analyze().then(dna => { currentDNA = dna; });
     },
     onBugCountChanged: (count: number) => {
@@ -408,27 +494,32 @@ export function activate(context: vscode.ExtensionContext): void {
       worldState = updateWeather(worldState, count);
       creatureManager.updateBugEffect(count > 0);
       panelProvider.postMessage({ type: 'bugCountChanged', count });
-      sendWorldUpdate();
-      saveState();
+      syncAndSave();
     },
     onFileHealthChanged: (filePath: string, health: FileHealth) => {
       const result = creatureManager.updateFileHealth(filePath, health);
-      if (result?.improved) {
-        // File got healthier! Trigger creature-specific recovery effect
-        const healedId = creatureManager.getByFile(filePath);
-        const healedCreature = healedId ? creatureManager.getById(healedId) : undefined;
-        if (healedCreature) {
-          panelProvider.postMessage({
-            type: 'creatureHealed',
-            creatureId: healedCreature.id,
-            creatureName: healedCreature.name,
-          });
-          broadcastSpeech('heal', healedCreature.id); // Feature A: living words on heal
+      const creatureId = creatureManager.getByFile(filePath);
+      const creature = creatureId ? creatureManager.getById(creatureId) : undefined;
+
+      if (result?.improved && creature) {
+        if (result.bugsDelta > 0) {
+          resetDailyStatsIfNeeded();
+          dailyStats.bugsFixed += result.bugsDelta;
         }
+        panelProvider.postMessage({
+          type: 'creatureHealed',
+          creatureId: creature.id,
+          creatureName: creature.name,
+        });
+        broadcastSpeech('heal', creature.id);
         updateStatusBar();
+      } else if (result?.worsened && creature) {
+        panelProvider.postMessage({
+          type: 'creatureWorsened',
+          creatureId: creature.id,
+        });
       }
-      sendWorldUpdate();
-      saveState();
+      syncAndSave();
     },
   });
 
@@ -446,24 +537,29 @@ export function activate(context: vscode.ExtensionContext): void {
         } else if (message.action === 'pet') {
           creatureManager.pet(message.targetId);
         }
-        sendWorldUpdate();
-        saveState();
+        syncAndSave();
         return true;
       case 'care': {
         const careCreature = creatureManager.getById(message.targetId);
         if (careCreature) {
           const health = careCreature.fileHealth;
-          const daysSince = (Date.now() - health.lastModified) / (1000 * 60 * 60 * 24);
+          const daysSince = (Date.now() - health.lastModified) / MS_PER_DAY;
 
           let action: string;
           let description: string;
           if (health.bugCount > 0) {
             action = 'cure';
             description = `${health.bugCount}件のバグを修正します (TODO, console.log, any型)`;
-          } else if (health.lineCount > 300) {
+          } else if (health.lineCount > LINE_COUNT_HEAVY) {
             action = 'diet';
             description = `${health.lineCount}行 → 200行以下にリファクタリングします`;
-          } else if (daysSince > 3) {
+          } else if ((health.maxNesting ?? 0) > NESTING_THRESHOLD) {
+            action = 'untangle';
+            description = `ネスト${health.maxNesting}段 → 早期リターンで浅くします`;
+          } else if ((health.longestFunction ?? 0) > FUNCTION_LENGTH_THRESHOLD) {
+            action = 'split';
+            description = `${health.longestFunction}行の関数 → 小さく分割します`;
+          } else if (daysSince > STALE_DAYS) {
             action = 'wake';
             description = `${Math.floor(daysSince)}日間放置 → レビューして最新化します`;
           } else {
@@ -490,8 +586,7 @@ export function activate(context: vscode.ExtensionContext): void {
             sendHealCommand(aiTerminal.terminal, message.action, approvedCreature);
           }
           creatureManager.feed(message.creatureId);
-          sendWorldUpdate();
-          saveState();
+          syncAndSave();
         }
         return true;
       }
@@ -507,19 +602,16 @@ export function activate(context: vscode.ExtensionContext): void {
           }
         }
         creatureManager.feed(message.targetId);
-        sendWorldUpdate();
-        saveState();
+        syncAndSave();
         return true;
       }
       case 'nameCreature':
         creatureManager.renameCreature(message.creatureId, message.name);
-        sendWorldUpdate();
-        saveState();
+        syncAndSave();
         return true;
       case 'moveCreature':
         creatureManager.moveCreature(message.creatureId, message.position);
-        sendWorldUpdate();
-        saveState();
+        syncAndSave();
         return true;
       case 'revealFile': {
         const revealCreature = creatureManager.getById(message.creatureId);
@@ -531,8 +623,12 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       case 'clearAllCreatures':
         creatureManager.loadCreatures([]);
+        syncAndSave();
+        return true;
+      case 'clearGraveStones':
+        worldState = clearGraveStones(worldState);
         sendWorldUpdate();
-        saveState();
+        syncAndSave();
         return true;
       default:
         return false;
@@ -555,8 +651,7 @@ export function activate(context: vscode.ExtensionContext): void {
           terminal.show();
           agentManager.updateStatus(agent.id, 'running');
           panelProvider.postMessage({ type: 'agentAdded', agentId: agent.id });
-          sendWorldUpdate();
-          saveState();
+          syncAndSave();
         })();
         return true;
       }
@@ -571,8 +666,7 @@ export function activate(context: vscode.ExtensionContext): void {
           delTerminal.dispose();
         }
         agentManager.removeAgent(message.agentId);
-        sendWorldUpdate();
-        saveState();
+        syncAndSave();
         return true;
       }
       case 'stopAgent': {
@@ -583,8 +677,7 @@ export function activate(context: vscode.ExtensionContext): void {
           stopTerminal.dispose();
         }
         agentManager.removeAgent(message.agentId);
-        sendWorldUpdate();
-        saveState();
+        syncAndSave();
         return true;
       }
       case 'moveAgent':
@@ -606,80 +699,37 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       case 'sitAgent':
         agentManager.toggleSit(message.agentId);
-        sendWorldUpdate();
-        saveState();
+        syncAndSave();
         return true;
       case 'chatAgent':
-        // eslint-disable-next-line no-console -- placeholder
-        console.debug(`[Digital Life] chatAgent: ${message.agentId}`);
+        // Chat agent messages are handled by the terminal directly
         return true;
       default:
         return false;
     }
   }
 
-  // ── Lineup (点呼) ─────────────────────────────────────────
-  let lineupTimer: ReturnType<typeof setTimeout> | null = null;
-
-  function performLineup(): void {
-    // Cancel any active lineup timer
-    if (lineupTimer) { clearTimeout(lineupTimer); }
-
-    const allCreatures = creatureManager.getAll().filter(c => c.stage !== 'egg');
-    const allAgents = agentManager.getAll();
-
-    // Grid layout: creatures in upper rows, agents in lower row
-    const cols = Math.max(4, Math.ceil(Math.sqrt(allCreatures.length + allAgents.length)));
-    const cellW = CANVAS_WIDTH / (cols + 1);
-    const cellH = 50;
-    const startY = 50;
-
-    // Place creatures in grid
-    allCreatures.forEach((c, i) => {
-      const col = i % cols;
-      const row = Math.floor(i / cols);
-      creatureManager.setTargetPosition(c.id, {
-        x: cellW * (col + 1),
-        y: startY + cellH * row,
-      });
-    });
-
-    // Place agents in bottom row
-    const agentY = CANVAS_HEIGHT - 60;
-    const agentCellW = CANVAS_WIDTH / (allAgents.length + 1);
-    allAgents.forEach((a, i) => {
-      agentManager.setTargetPosition(a.id, {
-        x: agentCellW * (i + 1),
-        y: agentY,
-      });
-    });
-
-    panelProvider.postMessage({ type: 'lineupActive', active: true });
-    sendWorldUpdate();
-
-    // Auto-dismiss after 5 seconds
-    lineupTimer = setTimeout(() => {
-      creatureManager.clearAllTargets();
-      agentManager.clearAllTargets();
-      panelProvider.postMessage({ type: 'lineupActive', active: false });
-      sendWorldUpdate();
-      lineupTimer = null;
-    }, 5000);
-  }
 
   function handleLifecycleMessage(message: WebToExtMessage): boolean {
     switch (message.type) {
       case 'ready':
+        // Ensure timeOfDay is fresh on startup
+        worldState = updateTimeOfDay(worldState);
         sendWorldUpdate();
+        sendSettings(); // Sync VS Code settings to webview
         if (!isFirstRun) {
-          setTimeout(() => sendMorningDiary(), 2000);
+          setTimeout(() => sendMorningWakeUp(), 2000);
           broadcastSpeech(getTimeOfDaySpeechEvent());
         }
         setTimeout(() => updateFriendships(), 3000);
         startTimeOfDayTimer();
-        return true;
-      case 'lineup':
-        performLineup();
+        // Fetch real weather, ISS, and NEO data
+        { const cfg = vscode.workspace.getConfiguration('digitalLife');
+          if (cfg.get<boolean>('realWeather', true)) { void fetchRealWeather(); }
+        }
+        void fetchISSLocation();
+        void fetchNEOData();
+        void fetchAndSpeakCatFact();
         return true;
       case 'spawnFile': {
         if (!creatureManager.hasCreatureForFile(message.filePath) && creatureManager.getCount() < MAX_CREATURES) {
@@ -702,10 +752,39 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   }
 
+  function handleUtilityMessage(message: WebToExtMessage): boolean {
+    switch (message.type) {
+      case 'screenshot': {
+        // Save screenshot as PNG file and offer to share
+        const imageData = message.imageData;
+        const base64 = imageData.replace(/^data:image\/png;base64,/, '');
+        const buffer = Buffer.from(base64, 'base64');
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const fileName = `digital-life-${timestamp}.png`;
+        const filePath = path.join(workspacePath, fileName);
+        fs.writeFileSync(filePath, buffer);
+        void vscode.window.showInformationMessage(
+          `📷 Screenshot saved: ${fileName}`,
+          'Open', 'Copy Path'
+        ).then(choice => {
+          if (choice === 'Open') {
+            void vscode.commands.executeCommand('vscode.open', vscode.Uri.file(filePath));
+          } else if (choice === 'Copy Path') {
+            void vscode.env.clipboard.writeText(filePath);
+          }
+        });
+        return true;
+      }
+      default:
+        return false;
+    }
+  }
+
   panelProvider.onMessage((message) => {
     handleCreatureMessage(message)
       || handleAgentMessage(message)
-      || handleLifecycleMessage(message);
+      || handleLifecycleMessage(message)
+      || handleUtilityMessage(message);
   });
 
   // Terminal close handler for agents — terminal closed = agent leaves the plaza
@@ -715,10 +794,120 @@ export function activate(context: vscode.ExtensionContext): void {
         if (storedTerminal === closedTerminal) {
           agentTerminals.delete(agentId);
           agentManager.removeAgent(agentId);
-          sendWorldUpdate();
-          saveState();
+          syncAndSave();
           return;
         }
+      }
+    })
+  );
+
+  // ── Real weather from Open-Meteo (free, no API key) ──
+  let lastWeatherFetch = 0;
+  const WEATHER_FETCH_INTERVAL = 30 * 60 * 1000; // 30 minutes
+
+  async function fetchRealWeather(): Promise<void> {
+    const now = Date.now();
+    if (now - lastWeatherFetch < WEATHER_FETCH_INTERVAL) return;
+    lastWeatherFetch = now;
+
+    const rw = await apiService.fetchRealWeather();
+    if (rw !== null) {
+      worldState = updateRealWeather(worldState, rw);
+      sendWorldUpdate();
+    }
+  }
+
+  // ── ISS Location (free, no API key) ──
+  let lastISSFetch = 0;
+  const ISS_FETCH_INTERVAL = 60 * 1000; // check every 60 seconds
+
+  async function fetchISSLocation(): Promise<void> {
+    const now = Date.now();
+    if (now - lastISSFetch < ISS_FETCH_INTERVAL) return;
+    lastISSFetch = now;
+
+    const issData = await apiService.fetchISSLocation();
+    if (issData) {
+      worldState = updateISS(worldState, issData);
+      sendWorldUpdate();
+    }
+  }
+
+  // ── NASA Near-Earth Objects (free, DEMO_KEY) ──
+  let lastNEOFetch = 0;
+  const NEO_FETCH_INTERVAL = 60 * 60 * 1000; // check every hour
+
+  async function fetchNEOData(): Promise<void> {
+    const now = Date.now();
+    if (now - lastNEOFetch < NEO_FETCH_INTERVAL) return;
+    lastNEOFetch = now;
+
+    const neoData = await apiService.fetchNEOData();
+    if (neoData) {
+      worldState = updateNEO(worldState, neoData);
+      sendWorldUpdate();
+    }
+  }
+
+  // ── Cat Facts for Dot creatures (catfact.ninja — free, no API key) ──
+  let lastCatFactTime = 0;
+  const CAT_FACT_INTERVAL = 5 * 60 * 1000; // every 5 minutes
+
+  async function fetchAndSpeakCatFact(): Promise<void> {
+    const now = Date.now();
+    if (now - lastCatFactTime < CAT_FACT_INTERVAL) return;
+
+    // Find a Dot creature to speak
+    const dots = creatureManager.getAll().filter(c => c.species === 'dot' && c.stage !== 'egg');
+    if (dots.length === 0) return;
+    lastCatFactTime = now;
+
+    const speaker = dots[Math.floor(Math.random() * dots.length)];
+    const fact = await apiService.fetchCatFact(speechLang);
+    if (fact) {
+      panelProvider.postMessage({ type: 'creatureSpeech', creatureId: speaker.id, text: fact });
+      outputChannel.appendLine(`[Digital Life] Cat fact: ${fact}`);
+    }
+  }
+
+  // ── Late-night coding awareness ──
+  let lateNightWarned = false;
+
+  function checkLateNight(): void {
+    const hour = new Date().getHours();
+    const isLateNight = hour >= 23 || hour < 5;
+
+    if (isLateNight && !lateNightWarned) {
+      lateNightWarned = true;
+      // Creatures get sleepy — broadcast sleep speech
+      broadcastSpeech('lateNight');
+      // Set all non-egg creatures to sleep animation via a gentle nudge
+      const all = creatureManager.getAll().filter(c => c.stage !== 'egg');
+      if (all.length > 0) {
+        const sleepiest = all[Math.floor(Math.random() * all.length)];
+        panelProvider.postMessage({ type: 'nudgeCreature', creatureId: sleepiest.id });
+      }
+    } else if (!isLateNight) {
+      lateNightWarned = false;
+    }
+  }
+
+  // ── VS Code settings sync ──
+  function sendSettings(): void {
+    const config = vscode.workspace.getConfiguration('digitalLife');
+    panelProvider.postMessage({
+      type: 'settings',
+      realWeather: config.get<boolean>('realWeather', true),
+      language: config.get<string>('language', 'auto'),
+      sound: config.get<boolean>('sound', true),
+      saveReaction: config.get<boolean>('saveReaction', true),
+    });
+  }
+
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration(e => {
+      if (e.affectsConfiguration('digitalLife')) {
+        sendSettings();
       }
     })
   );
@@ -726,9 +915,57 @@ export function activate(context: vscode.ExtensionContext): void {
   // Slow-tick counter for periodic checks (friendship, proactive care)
   let slowTickCounter = 0;
 
+  /** Check for neglected creatures — warn at 2 days, kill at 3 days */
+  function checkNeglect(): void {
+    const { critical, dead } = creatureManager.checkNeglect();
+
+    // Warning notifications (2 days without feeding)
+    for (const creature of critical) {
+      const result = showThrottledNotification(
+        'warning',
+        `⚠️ ${creature.name} が危篤です！早くfeedしないと明日には...`,
+        'パネルを開く'
+      );
+      if (result) {
+        void result.then(choice => {
+          if (choice === 'パネルを開く') {
+            void vscode.commands.executeCommand('digitalLife.showPanel');
+          }
+        });
+      }
+      panelProvider.postMessage({ type: 'creatureCritical', creatureId: creature.id, creatureName: creature.name });
+    }
+
+    // Death by neglect (3 days without feeding)
+    for (const creature of dead) {
+      const removed = creatureManager.removeCreatureById(creature.id);
+      if (removed) {
+        worldState = addGraveStone(
+          worldState,
+          removed.name,
+          removed.species,
+          removed.bornAt,
+          removed.sourceFile,
+          removed.position,
+        );
+        panelProvider.postMessage({
+          type: 'creatureDied',
+          creatureId: removed.id,
+          creatureName: removed.name,
+        });
+        showThrottledNotification('error', `💀 ${removed.name} は餓死しました...墓石が残されています。`);
+        syncAndSave();
+      }
+    }
+  }
+
   function tickAll(): void {
     creatureManager.tick(TICK_INTERVAL);
     agentManager.tick();
+
+    // Update time of day every tick (cheap — just compares hours)
+    worldState = updateTimeOfDay(worldState);
+
     sendWorldUpdate();
     throttledStatusBarUpdate();
 
@@ -738,6 +975,14 @@ export function activate(context: vscode.ExtensionContext): void {
       slowTickCounter = 0;
       updateFriendships();       // Feature D
       checkProactiveSuggestions(); // Feature E
+      checkLateNight();
+      checkNeglect();            // Neglect death system
+      if (vscode.workspace.getConfiguration('digitalLife').get<boolean>('realWeather', true)) {
+        void fetchRealWeather();
+      }
+      void fetchISSLocation();
+      void fetchNEOData();
+      void fetchAndSpeakCatFact();
     }
   }
 
@@ -815,6 +1060,7 @@ export function activate(context: vscode.ExtensionContext): void {
     dispose: () => {
       stopTickTimer();
       clearInterval(saveTimer);
+      if (timeOfDayTimer !== null) { clearInterval(timeOfDayTimer); }
       monitorManager.stop();
       saveState();
     },
@@ -870,9 +1116,48 @@ export function activate(context: vscode.ExtensionContext): void {
       }
 
       if (count > 0) {
-        saveState();
-        sendWorldUpdate();
+        syncAndSave();
       }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('digitalLife.focusWeakest', async () => {
+      const all = creatureManager.getAll().filter(c => c.stage !== 'egg');
+      if (all.length === 0) {
+        // No creatures — fall back to adopt
+        await vscode.commands.executeCommand('digitalLife.adoptFiles');
+        return;
+      }
+
+      // Find the creature with the worst health (highest urgency)
+      let worst = all[0];
+      let worstScore = 0;
+      for (const c of all) {
+        let score = 0;
+        if (c.hunger < 15) score += 50;
+        else if (c.hunger < 30) score += 40;
+        score += c.fileHealth.bugCount * 10;
+        if ((c.fileHealth.maxNesting ?? 0) > 4) score += 5;
+        if ((c.fileHealth.longestFunction ?? 0) > 50) score += 5;
+        if (score > worstScore) {
+          worstScore = score;
+          worst = c;
+        }
+      }
+
+      // Open the file in the editor
+      const uri = vscode.Uri.file(worst.sourceFile);
+      await vscode.window.showTextDocument(uri, { preview: true });
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('digitalLife.clearGraves', () => {
+      worldState = clearGraveStones(worldState);
+      sendWorldUpdate();
+      syncAndSave();
+      vscode.window.showInformationMessage('Digital Life: Gravestones cleared');
     })
   );
 
@@ -958,6 +1243,20 @@ export function activate(context: vscode.ExtensionContext): void {
           `deprecatedなAPIがあれば最新版に移行してください。`
         );
         break;
+      case 'untangle':
+        terminal.sendText(
+          `${relativePath}のネストが深すぎます（最大${health.maxNesting}段）。` +
+          `早期リターン（guard clause）パターンを使ってネストを浅くしてください。` +
+          `条件を反転してreturnし、ネストを最大3段までに抑えてください。`
+        );
+        break;
+      case 'split':
+        terminal.sendText(
+          `${relativePath}に${health.longestFunction}行の長い関数があります。` +
+          `この関数を20-30行の小さな関数に分割してください。` +
+          `各関数は1つの責務だけを持つようにし、適切な名前をつけてください。`
+        );
+        break;
     }
 
     // Award heal EXP bonus
@@ -977,6 +1276,12 @@ export function activate(context: vscode.ExtensionContext): void {
       agents: agentManager.getAll(),
     };
     panelProvider.postMessage(msg);
+  }
+
+  /** Convenience: broadcast current state and persist — the most common two-liner */
+  function syncAndSave(): void {
+    sendWorldUpdate();
+    saveState();
   }
 
   // Throttled status bar updates (every 5 seconds max)

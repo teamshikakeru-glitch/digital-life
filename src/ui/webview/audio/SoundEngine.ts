@@ -108,25 +108,37 @@ export class SoundEngine {
   }
 
   // ── Public API ─────────────────────────────────────────────
-  // Each method maps to a sound selected by the DQ team.
   //
-  // Event            → Sound file               → Reason
-  // ────────────────────────────────────────────────────────────
-  // Feed (ごはん)     → マウスダブルクリック       → 小気味よいパクパク感
-  // Pet / Care選択    → マウスクリック             → 軽いタッチ
-  // Hatch (孵化)      → 8bitジャンプ3             → 殻から飛び出す
-  // Commit            → 正解9                     → やったね！達成感
-  // Level Up          → 8bitジャンプ              → ジャンプ = 成長
-  // Death (別れ)      → 不正解3                   → 切なく短い
-  // Heal (回復)       → 完了6                     → 完了 = 元気に
-  // Speech (吹き出し) → 8bitかわす                → 最も軽い
-  // Suggestion (提案) → 8bitアラート1             → 注意を引く
-  // Approve (承認)    → 決定7                     → 決定音
-  // Morning (朝)      → 電源オン                  → セッション開始
-  // Error             → エラー1                   → そのまま
-  // Friendship        → 出題3                     → 柔らかい呼びかけ
-  // First Run         → 扉が開く2                 → 新しい世界への扉
-  // Cancel            → 8bitアラート3             → 軽い否定
+  // 堀井雄二チーム — サウンド設計書 v2
+  // 「ゲームの魂は音にある。触れた瞬間に世界が応える。」
+  //
+  // Event               → Sound file                  → Reason
+  // ─────────────────────────────────────────────────────────────
+  // Feed (ごはん)        → マウスダブルクリック          → パクパク感
+  // Pet / Care選択       → マウスクリック                → 軽いタッチ
+  // Hatch (孵化)         → 8bitジャンプ3                → 殻から飛び出す
+  // Commit               → 正解9                        → 達成感
+  // Level Up             → 8bitジャンプ                 → 成長のジャンプ
+  // Death (別れ)         → 不正解3                      → 切なく短い
+  // Heal (回復)          → 完了6                        → 元気に
+  // Speech (吹き出し)    → 8bitかわす                   → 最も軽い
+  // Suggestion (提案)    → 8bitアラート1                → 注意を引く
+  // Approve (承認/YES)   → 文字送りb長                  → RPG文字送り＝処方箋の音
+  // Morning (朝)         → 電源オン                     → セッション開始
+  // Error                → エラー1                      → そのまま
+  // Friendship           → 出題3                        → 柔らかい呼びかけ
+  // First Run            → 扉が開く2                    → 新しい世界への扉
+  // Cancel               → 8bitアラート3                → 軽い否定
+  // Agent Spawn          → 小型ロボットの駆動音1        → ロボット登場
+  // Save Sparkle         → 決定7                        → キラッ = 保存OK
+  //
+  // ── Per-species click sounds ──
+  // Dot  (dark, techy)   → タイピング-メカニカル単1     → キーボードの住人
+  // Puff (fluffy, shy)   → パフッ1                      → ふわふわ = バフッ
+  // Blob (slimy, chill)  → ぴちょん単発                 → スライム = 水滴
+  // Pip  (curious, quick) → パフッ2                     → 素早い軽いバフッ
+  // Wisp (mysterious)    → ネコ2                        → 神秘的な声
+  // Chomp (hungry, strong) → パフッ3                    → 力強い重めバフッ
 
   setMuted(muted: boolean): void { this.muted = muted; }
   isMuted(): boolean { return this.muted; }
@@ -140,29 +152,192 @@ export class SoundEngine {
   playHeal(): void         { this.play('heal', 0.45); }
   playSpeech(): void       { this.play('speech', 0.2); }
   playSuggestion(): void   { this.play('suggestion', 0.4); }
-  playApprove(): void      { this.play('approve', 0.4); }
+  playApprove(): void      { this.play('approve', 0.5); }
   playMorning(): void      { this.play('morning', 0.35); }
   playError(): void        { this.play('error', 0.35); }
   playFriendship(): void   { this.play('friendship', 0.25); }
   playFirstRun(): void     { this.play('firstRun', 0.45); }
   playCancel(): void       { this.play('cancel', 0.35); }
-  playAgentSpawn(): void     { this.play('agentSpawn', 0.5); }
-  playSelectCreature(): void { this.play('selectCreature', 0.35); }
+  playAgentSpawn(): void     { this.play('agentSpawn', 0.45); }
   playSelectAgent(): void    { this.play('selectAgent', 0.4); }
+  playSaveSpark(): void      { this.play('saveSpark', 0.35); }
+  playThunder(): void        { this.play('thunder', 0.3); }
+
+  /** Play species-specific click sound — each creature has its own voice */
+  playSelectCreature(species?: string): void {
+    switch (species) {
+      case 'dot':   this.play('selectDot', 0.4);   break;
+      case 'puff':  this.play('selectPuff', 0.35);  break;
+      case 'blob':  this.play('selectBlob', 0.35);  break;
+      case 'pip':   this.play('selectPip', 0.35);   break;
+      case 'wisp':  this.play('selectWisp', 0.35);  break;
+      case 'chomp': this.play('selectChomp', 0.4);  break;
+      default:      this.play('selectBlob', 0.35);  break; // fallback
+    }
+  }
+
+  // ── Ambient BGM system ──────────────────────────────────────
+  //
+  // Environmental sounds that change with weather and time of day.
+  // Rain uses the existing MP3 loop; other ambiences are synthesized.
+
+  private ambientSource: AudioBufferSourceNode | null = null;
+  private ambientGain: GainNode | null = null;
+  private ambientType: string = '';
+  private cricketTimers: number[] = [];
+  private birdTimers: number[] = [];
+
+  /** Update ambient sound based on current weather and time of day */
+  updateAmbient(weather: string, timeOfDay: string, realWeather: string | null): void {
+    if (this.muted) {
+      this.stopAmbient();
+      return;
+    }
+
+    // Determine ambient type
+    let newType = '';
+    const isRaining = weather === 'rainy' || realWeather === 'rain';
+    if (isRaining) {
+      newType = 'rain';
+    } else if (timeOfDay === 'night') {
+      newType = 'crickets';
+    } else if (timeOfDay === 'dawn' || timeOfDay === 'morning') {
+      newType = 'birds';
+    } else {
+      newType = 'wind';
+    }
+
+    if (newType === this.ambientType) return;
+    this.stopAmbient();
+    this.ambientType = newType;
+
+    switch (newType) {
+      case 'rain': this.startRainAmbient(); break;
+      case 'crickets': this.startCrickets(); break;
+      case 'birds': this.startBirds(); break;
+      case 'wind': this.startWind(); break;
+    }
+  }
+
+  stopAmbient(): void {
+    this.ambientType = '';
+    if (this.ambientSource) {
+      try { this.ambientSource.stop(); } catch { /* already stopped */ }
+      this.ambientSource = null;
+    }
+    if (this.ambientGain) {
+      this.ambientGain.disconnect();
+      this.ambientGain = null;
+    }
+    for (const t of this.cricketTimers) clearTimeout(t);
+    for (const t of this.birdTimers) clearTimeout(t);
+    this.cricketTimers = [];
+    this.birdTimers = [];
+  }
+
+  private startRainAmbient(): void {
+    const ctx = this.getContext();
+    const buffer = this.buffers.get('rainAmbient');
+    if (!buffer) return;
+    const source = ctx.createBufferSource();
+    const gain = ctx.createGain();
+    source.buffer = buffer;
+    source.loop = true;
+    gain.gain.value = 0.08;
+    source.connect(gain);
+    gain.connect(ctx.destination);
+    source.start();
+    this.ambientSource = source;
+    this.ambientGain = gain;
+  }
+
+  private startCrickets(): void {
+    const chirp = () => {
+      if (this.muted || this.ambientType !== 'crickets') return;
+      const ctx = this.getContext();
+      const now = ctx.currentTime;
+      // Two rapid oscillator bursts = cricket chirp
+      for (let i = 0; i < 2; i++) {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = 4200 + Math.random() * 800;
+        gain.gain.setValueAtTime(0, now + i * 0.06);
+        gain.gain.linearRampToValueAtTime(0.03, now + i * 0.06 + 0.015);
+        gain.gain.linearRampToValueAtTime(0, now + i * 0.06 + 0.04);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now + i * 0.06);
+        osc.stop(now + i * 0.06 + 0.05);
+      }
+      const next = 1500 + Math.random() * 3000;
+      this.cricketTimers.push(window.setTimeout(chirp, next));
+    };
+    chirp();
+  }
+
+  private startBirds(): void {
+    const tweet = () => {
+      if (this.muted || this.ambientType !== 'birds') return;
+      const ctx = this.getContext();
+      const now = ctx.currentTime;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      const baseFreq = 1800 + Math.random() * 1200;
+      osc.frequency.setValueAtTime(baseFreq, now);
+      osc.frequency.linearRampToValueAtTime(baseFreq * 1.3, now + 0.08);
+      osc.frequency.linearRampToValueAtTime(baseFreq * 0.9, now + 0.15);
+      gain.gain.setValueAtTime(0, now);
+      gain.gain.linearRampToValueAtTime(0.025, now + 0.03);
+      gain.gain.linearRampToValueAtTime(0, now + 0.18);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.2);
+      const next = 3000 + Math.random() * 5000;
+      this.birdTimers.push(window.setTimeout(tweet, next));
+    };
+    tweet();
+  }
+
+  private startWind(): void {
+    const ctx = this.getContext();
+    // White noise filtered to sound like gentle wind
+    const bufferSize = ctx.sampleRate * 2;
+    const noiseBuffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+    const data = noiseBuffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+      data[i] = (Math.random() * 2 - 1) * 0.5;
+    }
+    const source = ctx.createBufferSource();
+    source.buffer = noiseBuffer;
+    source.loop = true;
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 400;
+    filter.Q.value = 0.5;
+    const gain = ctx.createGain();
+    gain.gain.value = 0.015;
+    source.connect(filter);
+    filter.connect(gain);
+    gain.connect(ctx.destination);
+    source.start();
+    this.ambientSource = source;
+    this.ambientGain = gain;
+  }
 
   /** Speak text using Web Speech API (TTS). Falls back silently if unavailable. */
   speak(text: string): void {
     if (this.muted) return;
     const synth = window.speechSynthesis;
     if (!synth) return;
-    // Cancel any ongoing speech
     synth.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
-    // Detect language: if text contains CJK characters, use Japanese
     const hasCJK = /[\u3000-\u9FFF\uF900-\uFAFF]/.test(text);
     utterance.lang = hasCJK ? 'ja-JP' : 'en-US';
     utterance.rate = 1.1;
-    utterance.pitch = 1.3; // slightly high-pitched for cute creature voice
+    utterance.pitch = 1.3;
     utterance.volume = 0.7;
     synth.speak(utterance);
   }

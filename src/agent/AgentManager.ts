@@ -85,8 +85,8 @@ export class AgentManager {
       return;
     }
 
-    const newX = Math.max(16, Math.min(CANVAS_WIDTH - 16, agent.position.x + dx));
-    const newY = Math.max(16, Math.min(CANVAS_HEIGHT - 16, agent.position.y + dy));
+    const newX = Math.max(SPRITE_SIZE, Math.min(CANVAS_WIDTH - SPRITE_SIZE, agent.position.x + dx));
+    const newY = Math.max(SPRITE_SIZE, Math.min(CANVAS_HEIGHT - SPRITE_SIZE, agent.position.y + dy));
 
     this.agents.set(agentId, {
       ...agent,
@@ -152,6 +152,7 @@ export class AgentManager {
       }
 
       // Pick a new target randomly (more active than creatures)
+      // Lineup mode: stay put after reaching target
       if (!updated.targetPosition && Math.random() < 0.02) {
         updated = { ...updated, targetPosition: randomTarget() };
       }

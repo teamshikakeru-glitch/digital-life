@@ -1,4 +1,5 @@
 import { CreatureData, AgentData, SpriteData, ColorPalette, GraveStone } from '../../../types';
+import { MS_PER_DAY, NESTING_THRESHOLD, FUNCTION_LENGTH_THRESHOLD, LINE_COUNT_HEAVY, LINE_COUNT_OBESE, LINE_COUNT_CRITICAL, STALE_DAYS, CREATURE_RENDER_SIZE, SPRITE_SHEET_COLS, SPRITE_SHEET_ROWS } from '../../../constants';
 import { t } from '../i18n';
 // Default palette for sprite cache key generation (formerly in PuffSprites.ts)
 const DEFAULT_PALETTE: ColorPalette = [
@@ -26,19 +27,12 @@ export class SpriteRenderer {
   // Event-driven speech overrides (Feature A: Living words)
   private eventSpeech: Map<string, string> = new Map();
 
-  // Lineup mode — show all labels (点呼)
-  private lineupMode = false;
-
   setHealedIds(ids: Set<string>): void {
     this.healedIds = ids;
   }
 
   setEventSpeech(overrides: Map<string, string>): void {
     this.eventSpeech = overrides;
-  }
-
-  setLineupMode(active: boolean): void {
-    this.lineupMode = active;
   }
 
   constructor(private readonly ctx: CanvasRenderingContext2D) {
@@ -95,8 +89,8 @@ export class SpriteRenderer {
       return false;
     }
 
-    const cellW = img.naturalWidth / 4;
-    const cellH = img.naturalHeight / 5;
+    const cellW = img.naturalWidth / SPRITE_SHEET_COLS;
+    const cellH = img.naturalHeight / SPRITE_SHEET_ROWS;
     const srcX = col * cellW;
     const srcY = row * cellH;
 
@@ -119,12 +113,11 @@ export class SpriteRenderer {
     const sheetKey = `creature_${creature.species}_sheet`;
     const actionsKey = `creature_${creature.species}_actions`;
 
-    const CREATURE_RENDER_SIZE = 26;
     const renderSize = CREATURE_RENDER_SIZE;
 
     const lineCount = creature.fileHealth?.lineCount ?? 0;
     let scaleX = 1.0;
-    if (lineCount > 300) {
+    if (lineCount > LINE_COUNT_HEAVY) {
       scaleX = 1.3;
     } else if (lineCount > 100) {
       scaleX = 1.15;
@@ -191,10 +184,18 @@ export class SpriteRenderer {
       this.ctx.translate(-creature.position.x, -creature.position.y);
     }
 
-    // Adult glow effect
+    // Level-tier glow — grows with the creature's journey
     if (isAdult) {
-      this.ctx.shadowColor = '#FFD700';
-      this.ctx.shadowBlur = 6;
+      if (creature.level >= 9) {
+        this.ctx.shadowColor = '#FFD700';
+        this.ctx.shadowBlur = 10;
+      } else if (creature.level >= 7) {
+        this.ctx.shadowColor = '#87CEEB';
+        this.ctx.shadowBlur = 8;
+      } else {
+        this.ctx.shadowColor = '#FFD700';
+        this.ctx.shadowBlur = 4;
+      }
     }
 
     const bugCount = creature.fileHealth?.bugCount ?? 0;
@@ -218,55 +219,82 @@ export class SpriteRenderer {
       return;
     }
 
+    // Mutation visual effects
+    if (creature.mutation && creature.stage !== 'egg') {
+      this.renderMutationEffect(creature, renderSize);
+    }
+
+    // Neglect warning — creature flickers red when close to death
+    if (creature.neglectWarned) {
+      const flash = Math.sin(Date.now() / 200) > 0;
+      if (flash) {
+        this.ctx.save();
+        this.ctx.globalAlpha = 0.3;
+        this.ctx.fillStyle = '#FF0000';
+        this.ctx.beginPath();
+        this.ctx.arc(creature.position.x, creature.position.y, renderSize / 2, 0, Math.PI * 2);
+        this.ctx.fill();
+        this.ctx.restore();
+      }
+    }
+
     // Level badge (always visible) + name & path (selected only)
     if (creature.stage !== 'egg') {
       const cx = creature.position.x;
       const baseY = creature.position.y - renderSize / 2 - 6;
       const lvColor = isAdult ? '#FFD700' : creature.stage === 'baby' ? '#90CAF9' : '#AAAAAA';
 
-      if (isSelected || this.lineupMode) {
-        // ── Selected / Lineup: name + Lv (+ file path if selected) ──
+      if (isSelected) {
+        // ── Selected: name + Lv + file path ──
         this.ctx.save();
 
-        // Name + Lv line
+        // Name + species + Lv line
         const lvText = `Lv.${creature.level}`;
+        const speciesTag = `[${creature.species}]`;
         this.ctx.font = 'bold 9px sans-serif';
         const nameW = this.ctx.measureText(creature.name).width;
+        this.ctx.font = '7px sans-serif';
+        const speciesW = this.ctx.measureText(speciesTag).width;
         this.ctx.font = 'bold 7px sans-serif';
         const lvW = this.ctx.measureText(lvText).width;
-        const rowW = nameW + lvW + 6;
+        const rowW = nameW + speciesW + lvW + 10;
 
         this.ctx.fillStyle = 'rgba(0,0,0,0.8)';
         this.ctx.beginPath();
         this.ctx.roundRect(cx - rowW / 2 - 4, baseY - 10, rowW + 8, 13, 4);
         this.ctx.fill();
 
+        const labelStartX = cx - rowW / 2;
+        this.ctx.textAlign = 'left';
+
         this.ctx.fillStyle = '#fff';
         this.ctx.font = 'bold 9px sans-serif';
-        this.ctx.textAlign = 'center';
-        this.ctx.fillText(creature.name, cx - lvW / 2, baseY);
+        this.ctx.fillText(creature.name, labelStartX, baseY);
+
+        this.ctx.fillStyle = '#888';
+        this.ctx.font = '7px sans-serif';
+        this.ctx.fillText(speciesTag, labelStartX + nameW + 3, baseY);
 
         this.ctx.fillStyle = lvColor;
         this.ctx.font = 'bold 7px sans-serif';
-        this.ctx.textAlign = 'left';
-        this.ctx.fillText(lvText, cx + nameW / 2 - lvW / 2 + 3, baseY);
+        this.ctx.fillText(lvText, labelStartX + nameW + speciesW + 7, baseY);
 
-        // File path — only for individually selected creature (not lineup)
-        if (isSelected) {
-          const fullPath = creature.sourceFile;
-          const shortPath = fullPath.split('/').slice(-2).join('/');
-          this.ctx.font = '7px sans-serif';
-          this.ctx.textAlign = 'center';
-          const pathW = this.ctx.measureText(shortPath).width;
+        // File path
+        const fullPath = creature.sourceFile;
+        const shortPath = fullPath.split('/').slice(-2).join('/');
+        this.ctx.font = '7px sans-serif';
+        this.ctx.textAlign = 'center';
+        const pathW = this.ctx.measureText(shortPath).width;
 
-          this.ctx.fillStyle = 'rgba(0,0,0,0.7)';
-          this.ctx.beginPath();
-          this.ctx.roundRect(cx - pathW / 2 - 4, baseY - 22, pathW + 8, 11, 3);
-          this.ctx.fill();
+        this.ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        this.ctx.beginPath();
+        this.ctx.roundRect(cx - pathW / 2 - 4, baseY - 22, pathW + 8, 11, 3);
+        this.ctx.fill();
 
-          this.ctx.fillStyle = '#90CAF9';
-          this.ctx.fillText(shortPath, cx, baseY - 13);
+        this.ctx.fillStyle = '#90CAF9';
+        this.ctx.fillText(shortPath, cx, baseY - 13);
 
+        {
           // Selection ring
           this.ctx.strokeStyle = 'rgba(255,215,0,0.6)';
           this.ctx.lineWidth = 1.5;
@@ -275,17 +303,6 @@ export class SpriteRenderer {
           this.ctx.stroke();
         }
 
-        // Lineup: health indicator dot
-        if (this.lineupMode) {
-          const h = creature.fileHealth;
-          const dotColor = h.bugCount > 0 ? '#EF5350' :
-                           h.lineCount > 400 ? '#FFA726' :
-                           creature.hunger < 20 ? '#FFEE58' : '#66BB6A';
-          this.ctx.fillStyle = dotColor;
-          this.ctx.beginPath();
-          this.ctx.arc(cx + rowW / 2 + 6, baseY - 4, 3, 0, Math.PI * 2);
-          this.ctx.fill();
-        }
 
         this.ctx.restore();
       } else {
@@ -314,6 +331,11 @@ export class SpriteRenderer {
 
     // File health effects
     this.renderHealthEffects(creature, renderSize);
+
+    // Level-tier visual rewards — visible proof of growth
+    if (creature.stage === 'adult') {
+      this.renderLevelAura(creature, renderSize);
+    }
 
     // Speech bubble — creatures speak through feelings, not numbers
     this.renderSpeechBubble(creature, renderSize);
@@ -385,17 +407,23 @@ export class SpriteRenderer {
     if (this.healedIds.has(creature.id)) return t('bubble_healed');
 
     const h = creature.fileHealth;
-    const stale = (Date.now() - h.lastModified) / 864e5;
+    const stale = (Date.now() - h.lastModified) / MS_PER_DAY;
 
     // Feature B: Richer emotional vocabulary based on specific conditions
     if (creature.hunger < 10)   return t('bubble_starving');
     if (creature.hunger < 20)   return t('bubble_hungry');
     if (h.bugCount > 5)         return t('bubble_very_sick');
     if (h.bugCount > 2)         return t('bubble_sick');
-    if (h.lineCount > 500)      return t('bubble_very_heavy');
-    if (h.lineCount > 400)      return t('bubble_heavy');
+    if (h.lineCount > LINE_COUNT_CRITICAL)  return t('bubble_very_heavy');
+    if (h.lineCount > LINE_COUNT_OBESE)    return t('bubble_heavy');
+    if ((h.maxNesting ?? 0) > NESTING_THRESHOLD) return t('bubble_tangled');
+    if ((h.longestFunction ?? 0) > FUNCTION_LENGTH_THRESHOLD) return t('bubble_bloated');
     if (stale > 10)             return t('bubble_abandoned');
     if (stale > 5)              return t('bubble_sleepy');
+    // Late-night awareness — creatures gently remind you to rest
+    const hour = new Date().getHours();
+    if (hour >= 23 || hour < 5) return t('bubble_late_night');
+
     if (creature.happiness > 80 && h.bugCount === 0 && h.lineCount < 200) return t('bubble_perfect');
     if (creature.happiness > 70 && h.bugCount === 0) return t('bubble_happy');
     return null;
@@ -436,10 +464,10 @@ export class SpriteRenderer {
 
     // Abandoned detection
     const lastMod = creature.fileHealth?.lastModified ?? Date.now();
-    const daysSinceModified = (Date.now() - lastMod) / (1000 * 60 * 60 * 24);
+    const daysSinceModified = (Date.now() - lastMod) / MS_PER_DAY;
 
-    // 3+ days abandoned -> ZZZ
-    if (daysSinceModified > 3) {
+    // Abandoned -> ZZZ
+    if (daysSinceModified > STALE_DAYS) {
       this.ctx.save();
       this.ctx.font = 'bold 8px sans-serif';
       this.ctx.fillStyle = '#90A4AE';
@@ -461,6 +489,73 @@ export class SpriteRenderer {
       this.ctx.fill();
       this.ctx.restore();
     }
+  }
+
+  /**
+   * Level-tier visual rewards — the reason to keep coding.
+   *   Lv 5-6: gentle sparkle orbit
+   *   Lv 7-8: pulsing aura ring
+   *   Lv 9+:  golden crown particles + aura
+   */
+  private renderLevelAura(creature: CreatureData, renderSize: number): void {
+    const lv = creature.level;
+    if (lv < 5) return;
+
+    const cx = creature.position.x;
+    const cy = creature.position.y;
+    const time = Date.now() / 1000;
+
+    this.ctx.save();
+
+    if (lv >= 9) {
+      // Crown tier: orbiting golden stars + warm glow
+      const starCount = Math.min(lv - 6, 8);
+      this.ctx.globalAlpha = 0.7;
+      this.ctx.fillStyle = '#FFD700';
+      for (let i = 0; i < starCount; i++) {
+        const angle = (i / starCount) * Math.PI * 2 + time * 1.2;
+        const r = renderSize / 2 + 6 + Math.sin(time * 2 + i) * 2;
+        const sx = cx + Math.cos(angle) * r;
+        const sy = cy + Math.sin(angle) * r - 2;
+        this.ctx.beginPath();
+        this.ctx.arc(sx, sy, 1.8, 0, Math.PI * 2);
+        this.ctx.fill();
+      }
+
+      // Warm underglow
+      this.ctx.globalAlpha = 0.12 + Math.sin(time * 1.5) * 0.05;
+      const grad = this.ctx.createRadialGradient(cx, cy, 0, cx, cy, renderSize / 2 + 8);
+      grad.addColorStop(0, '#FFD700');
+      grad.addColorStop(1, 'transparent');
+      this.ctx.fillStyle = grad;
+      this.ctx.beginPath();
+      this.ctx.arc(cx, cy, renderSize / 2 + 8, 0, Math.PI * 2);
+      this.ctx.fill();
+    } else if (lv >= 7) {
+      // Aura tier: pulsing blue-white ring
+      const pulse = 0.3 + Math.sin(time * 2) * 0.15;
+      this.ctx.globalAlpha = pulse;
+      this.ctx.strokeStyle = '#87CEEB';
+      this.ctx.lineWidth = 1.5;
+      this.ctx.beginPath();
+      this.ctx.arc(cx, cy, renderSize / 2 + 4 + Math.sin(time * 3) * 1.5, 0, Math.PI * 2);
+      this.ctx.stroke();
+    } else {
+      // Sparkle tier: 2 orbiting dots
+      this.ctx.globalAlpha = 0.5 + Math.sin(time * 2) * 0.2;
+      this.ctx.fillStyle = '#C5CAE9';
+      for (let i = 0; i < 2; i++) {
+        const angle = (i / 2) * Math.PI * 2 + time * 0.8;
+        const r = renderSize / 2 + 5;
+        const sx = cx + Math.cos(angle) * r;
+        const sy = cy + Math.sin(angle) * r;
+        this.ctx.beginPath();
+        this.ctx.arc(sx, sy, 1.2, 0, Math.PI * 2);
+        this.ctx.fill();
+      }
+    }
+
+    this.ctx.restore();
   }
 
   renderGraveStone(grave: GraveStone): void {
@@ -755,6 +850,114 @@ export class SpriteRenderer {
     this.ctx.bezierCurveTo(x, y + size, x + size, y + size * 0.7, x + size, y + size * 0.3);
     this.ctx.bezierCurveTo(x + size, y, x, y, x, y + size * 0.3);
     this.ctx.fill();
+  }
+
+  /** Render mutation-specific visual effects around a creature */
+  private renderMutationEffect(creature: CreatureData, renderSize: number): void {
+    const cx = creature.position.x;
+    const cy = creature.position.y;
+    const time = Date.now() / 1000;
+    const r = renderSize / 2;
+
+    this.ctx.save();
+
+    switch (creature.mutation) {
+      case 'nightGlow': {
+        // Eyes glow bright in the dark — pulsing white/yellow aura from center
+        const pulse = 0.4 + Math.sin(time * 2) * 0.2;
+        const gradient = this.ctx.createRadialGradient(cx, cy - 2, 2, cx, cy - 2, r + 4);
+        gradient.addColorStop(0, `rgba(255, 255, 200, ${pulse})`);
+        gradient.addColorStop(1, 'rgba(255, 255, 200, 0)');
+        this.ctx.fillStyle = gradient;
+        this.ctx.beginPath();
+        this.ctx.arc(cx, cy - 2, r + 4, 0, Math.PI * 2);
+        this.ctx.fill();
+        break;
+      }
+      case 'rainbow': {
+        // Rainbow shimmer ring — rotating hue
+        const hue = (time * 60) % 360;
+        this.ctx.strokeStyle = `hsla(${hue}, 100%, 60%, 0.5)`;
+        this.ctx.lineWidth = 1.5;
+        this.ctx.shadowColor = `hsla(${hue}, 100%, 60%, 0.8)`;
+        this.ctx.shadowBlur = 6;
+        this.ctx.beginPath();
+        this.ctx.arc(cx, cy, r + 3, 0, Math.PI * 2);
+        this.ctx.stroke();
+        // Sparkle particles
+        for (let i = 0; i < 3; i++) {
+          const angle = time * 1.5 + (i * Math.PI * 2) / 3;
+          const px = cx + Math.cos(angle) * (r + 5);
+          const py = cy + Math.sin(angle) * (r + 5);
+          this.ctx.fillStyle = `hsla(${(hue + i * 120) % 360}, 100%, 70%, 0.8)`;
+          this.ctx.beginPath();
+          this.ctx.arc(px, py, 1.5, 0, Math.PI * 2);
+          this.ctx.fill();
+        }
+        break;
+      }
+      case 'speedster': {
+        // Afterimage / speed lines trailing behind
+        this.ctx.globalAlpha = 0.15;
+        for (let i = 1; i <= 3; i++) {
+          const offsetX = -i * 3 * (creature.animationState === 'walk_right' ? 1 : creature.animationState === 'walk_left' ? -1 : 0);
+          const offsetY = -i * 3 * (creature.animationState === 'walk_down' ? 1 : creature.animationState === 'walk_up' ? -1 : 0);
+          if (offsetX !== 0 || offsetY !== 0) {
+            this.ctx.fillStyle = '#87CEEB';
+            this.ctx.beginPath();
+            this.ctx.arc(cx + offsetX, cy + offsetY, r - i, 0, Math.PI * 2);
+            this.ctx.fill();
+          }
+        }
+        // Speed lines when moving
+        if (creature.targetPosition) {
+          this.ctx.globalAlpha = 0.3;
+          this.ctx.strokeStyle = '#FFFFFF';
+          this.ctx.lineWidth = 1;
+          for (let i = 0; i < 4; i++) {
+            const ly = cy - r + i * (r * 2 / 3);
+            this.ctx.beginPath();
+            this.ctx.moveTo(cx - r - 4 - Math.random() * 3, ly);
+            this.ctx.lineTo(cx - r - 8 - Math.random() * 5, ly);
+            this.ctx.stroke();
+          }
+        }
+        break;
+      }
+      case 'zen': {
+        // Calm aura — soft rings pulsing outward
+        for (let i = 0; i < 3; i++) {
+          const phase = (time + i * 0.8) % 2.4;
+          const radius = r + phase * 6;
+          const alpha = Math.max(0, 0.3 - phase * 0.125);
+          this.ctx.strokeStyle = `rgba(144, 238, 144, ${alpha})`;
+          this.ctx.lineWidth = 1;
+          this.ctx.beginPath();
+          this.ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+          this.ctx.stroke();
+        }
+        break;
+      }
+      case 'hyperactive': {
+        // Sparkle burst — constant tiny particles
+        this.ctx.globalAlpha = 0.7;
+        const colors = ['#FFD700', '#FF6B6B', '#4FC3F7', '#81C784'];
+        for (let i = 0; i < 5; i++) {
+          const seed = (time * 3 + i * 1.7) % 1;
+          const angle = (time * 2 + i * 1.3) % (Math.PI * 2);
+          const dist = r + seed * 8;
+          const px = cx + Math.cos(angle) * dist;
+          const py = cy + Math.sin(angle) * dist - seed * 6;
+          this.ctx.fillStyle = colors[i % colors.length];
+          this.ctx.beginPath();
+          this.ctx.arc(px, py, 1 + seed, 0, Math.PI * 2);
+          this.ctx.fill();
+        }
+        break;
+      }
+    }
+
+    this.ctx.restore();
   }
 
   renderInteractionHeart(

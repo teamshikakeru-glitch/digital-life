@@ -135,6 +135,7 @@ export class PanelProvider implements vscode.WebviewViewProvider {
     // Mapping by the Dragon Quest Development Team (堀井雄二)
     const soundsDir = path.join(this.extensionUri.fsPath, 'assets', 'sounds');
     const soundMap: Record<string, string> = {
+      // ── Core actions ──
       feed:       this.toBase64(path.join(soundsDir, 'マウスダブルクリック.mp3')),
       pet:        this.toBase64(path.join(soundsDir, 'マウスクリック.mp3')),
       hatch:      this.toBase64(path.join(soundsDir, '8bitジャンプ3.mp3')),
@@ -144,15 +145,33 @@ export class PanelProvider implements vscode.WebviewViewProvider {
       heal:       this.toBase64(path.join(soundsDir, '完了6.mp3')),
       speech:     this.toBase64(path.join(soundsDir, '8bitかわす.mp3')),
       suggestion: this.toBase64(path.join(soundsDir, '8bitアラート1.mp3')),
-      approve:    this.toBase64(path.join(soundsDir, '決定7.mp3')),
+      approve:    this.toBase64(path.join(soundsDir, '文字送りb長.mp3')),  // RPG text scroll for care approval
       morning:    this.toBase64(path.join(soundsDir, '電源オン.mp3')),
       error:      this.toBase64(path.join(soundsDir, 'エラー1.mp3')),
       friendship: this.toBase64(path.join(soundsDir, '出題3.mp3')),
       firstRun:   this.toBase64(path.join(soundsDir, '扉が開く2.mp3')),
       cancel:     this.toBase64(path.join(soundsDir, '8bitアラート3.mp3')),
-      agentSpawn: this.toBase64(path.join(soundsDir, '扉が開く2.mp3')),
-      selectCreature: this.toBase64(path.join(soundsDir, 'ぴちょん単発.mp3')),
+      agentSpawn: this.toBase64(path.join(soundsDir, '小型ロボットの駆動音1.mp3')),  // Robot arrives
       selectAgent:    this.toBase64(path.join(soundsDir, '選択9.mp3')),
+      saveSpark:      this.toBase64(path.join(soundsDir, '決定7.mp3')),  // File save sparkle
+
+      // ── Per-species click sounds (each creature has a unique voice) ──
+      // puff (black cat)       → cat meow
+      // dot  (round creature)  → soft puff
+      // blob (slimy, chill)    → water drop
+      // pip  (curious, quick)  → light puff
+      // wisp (mysterious)      → mechanical keyboard tap
+      // chomp (hungry, strong) → heavy puff
+      selectDot:   this.toBase64(path.join(soundsDir, 'パフッ1.mp3')),
+      selectPuff:  this.toBase64(path.join(soundsDir, 'ネコ2.mp3')),
+      selectBlob:  this.toBase64(path.join(soundsDir, 'ぴちょん単発.mp3')),
+      selectPip:   this.toBase64(path.join(soundsDir, 'パフッ2.mp3')),
+      selectWisp:  this.toBase64(path.join(soundsDir, 'タイピング-メカニカル単1.mp3')),
+      selectChomp: this.toBase64(path.join(soundsDir, 'パフッ3.mp3')),
+
+      // ── Weather ambience ──
+      rainAmbient: this.toBase64(path.join(soundsDir, '雨音ループ.mp3')),
+      thunder:     this.toBase64(path.join(soundsDir, '雷1.mp3')),
     };
 
     return `<!DOCTYPE html>
@@ -183,9 +202,9 @@ export class PanelProvider implements vscode.WebviewViewProvider {
       <div id="toolbar-center">
         <button id="btn-feed"      class="tool-btn" title="Feed">Feed</button>
         <button id="btn-care"      class="tool-btn" title="Care">Care</button>
-        <button id="btn-lineup"    class="tool-btn" title="Lineup">Lineup</button>
         <button id="btn-add-agent" class="tool-btn" title="Helper">+ Helper</button>
         <button id="btn-switch-agent" class="tool-btn" title="Switch Agent">🔄</button>
+        <button id="btn-screenshot" class="tool-btn" title="Screenshot">\u{1F4F7}</button>
         <button id="btn-lang"      class="tool-btn" title="Language">EN</button>
         <button id="btn-mute"      class="tool-btn" title="Sound">Sound</button>
       </div>

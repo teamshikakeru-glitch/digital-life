@@ -37,7 +37,7 @@ function lerpPosition(current: { x: number; y: number }, target: { x: number; y:
   };
 }
 
-// Canvas setup
+// Canvas setup with HiDPI support
 const canvas = document.getElementById('game-canvas') as HTMLCanvasElement;
 const ctx = canvas.getContext('2d');
 
@@ -45,8 +45,19 @@ if (!ctx) {
   throw new Error('Failed to get 2D context');
 }
 
-// Disable image smoothing for pixel art
-ctx.imageSmoothingEnabled = false;
+/** Scale canvas buffer for HiDPI displays while keeping game coords at CANVAS_WIDTH x CANVAS_HEIGHT */
+function updateCanvasSize(): void {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = CANVAS_WIDTH * dpr;
+  canvas.height = CANVAS_HEIGHT * dpr;
+  ctx!.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx!.imageSmoothingEnabled = false;
+}
+updateCanvasSize();
+
+// Re-scale on DPR changes (e.g. moving window between monitors)
+window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`)
+  .addEventListener('change', updateCanvasSize);
 
 const renderer = new GameRenderer(ctx);
 const soundEngine = new SoundEngine();
@@ -273,7 +284,8 @@ canvas.addEventListener('pointerup', (event: PointerEvent) => {
     } else if (!dragMoved) {
       // Tap (no drag): select creature + reveal file
       selectedCreatureId = creatureId;
-      soundEngine.playSelectCreature();
+      const tappedCreature = creatures.find(c => c.id === creatureId);
+      soundEngine.playSelectCreature(tappedCreature?.species);
       vscode.postMessage({ type: 'revealFile', creatureId });
       tapHandledByPointerUp = true; // suppress duplicate click event
     }
@@ -323,6 +335,7 @@ const btnFeed = document.getElementById('btn-feed');
 const btnCare = document.getElementById('btn-care');
 const btnMute = document.getElementById('btn-mute');
 const btnLang = document.getElementById('btn-lang');
+const btnScreenshot = document.getElementById('btn-screenshot');
 const feedIndicator = document.getElementById('feed-mode-indicator');
 const eduMessage = document.getElementById('edu-message');
 
@@ -335,17 +348,12 @@ const eventSpeechOverrides: Map<string, { text: string; timestamp: number }> = n
 // Feature D: Friendship pairs (creature ID pairs from import analysis)
 let friendshipPairs: readonly { a: string; b: string }[] = [];
 
-// ── Lineup (点呼) ───────────────────────────────────────────
-let lineupActive = false;
-
-const btnLineup = document.getElementById('btn-lineup');
-btnLineup?.addEventListener('click', () => {
-  vscode.postMessage({ type: 'lineup' });
-});
+// Session commit combo counter
+let sessionCommitCount = 0;
 
 // ── Guide flow ───────────────────────────────────────────────
 // A gentle first-time tutorial: Feed → Care, taught through experience
-type GuidePhase = 'none' | 'waitFeed' | 'waitCare' | 'done';
+type GuidePhase = 'none' | 'waitFeed' | 'waitCare' | 'tips' | 'done';
 let guidePhase: GuidePhase = 'none';
 
 // Message handling
@@ -385,10 +393,12 @@ window.addEventListener('message', (event: MessageEvent<ExtToWebMessage>) => {
       break;
     }
 
-    case 'commitDetected':
-      renderer.triggerCommitEffect();
+    case 'commitDetected': {
+      sessionCommitCount++;
+      renderer.triggerCommitEffect(message.stats?.streak ?? 0, sessionCommitCount);
       soundEngine.playCommit();
       break;
+    }
 
     case 'levelUp': {
       // Level-up celebration — sparkle effect on the creature
@@ -400,12 +410,66 @@ window.addEventListener('message', (event: MessageEvent<ExtToWebMessage>) => {
       break;
     }
 
+    case 'creatureCritical': {
+      // Critical warning — creature is about to die from neglect
+      const critCreature = creatures.find(c => c.id === message.creatureId);
+      if (critCreature) {
+        renderer.triggerWorsenEffect(critCreature.position.x, critCreature.position.y);
+        soundEngine.playError();
+      }
+      break;
+    }
+
+    case 'mutationUnlocked': {
+      // Mutation unlocked — sparkle celebration
+      const mutCreature = creatures.find(c => c.id === message.creatureId);
+      if (mutCreature) {
+        renderer.triggerFeedEffect(mutCreature.position.x, mutCreature.position.y);
+        soundEngine.playLevelUp();
+      }
+      break;
+    }
+
     case 'creatureHealed': {
       // Recovery effect — creature-specific green sparkles + healing bubble
       const healedCreature = creatures.find(c => c.id === message.creatureId);
       if (healedCreature) {
         renderer.triggerHealEffect(healedCreature.position.x, healedCreature.position.y, message.creatureId);
         soundEngine.playHeal();
+      }
+      break;
+    }
+
+    case 'creatureWorsened': {
+      const worsenedCreature = creatures.find(c => c.id === message.creatureId);
+      if (worsenedCreature) {
+        renderer.triggerWorsenEffect(worsenedCreature.position.x, worsenedCreature.position.y);
+        soundEngine.playError();
+      }
+      break;
+    }
+
+    case 'fileSaved': {
+      // File saved → golden sparkle on the creature + sound
+      const savedCreature = creatures.find(c => c.id === message.creatureId);
+      if (savedCreature) {
+        renderer.triggerSaveEffect(savedCreature.position.x, savedCreature.position.y);
+        soundEngine.playSaveSpark();
+      }
+      break;
+    }
+
+    case 'settings': {
+      // Apply settings from VS Code configuration
+      if (message.language && message.language !== 'auto') {
+        setLanguage(message.language as import('./i18n').Language);
+        applyToolbarLabels();
+      }
+      if (typeof message.sound === 'boolean') {
+        soundEngine.setMuted(!message.sound);
+        if (btnMute) {
+          btnMute.textContent = message.sound ? '\u{1F50A}' : '\u{1F507}';
+        }
       }
       break;
     }
@@ -438,11 +502,14 @@ window.addEventListener('message', (event: MessageEvent<ExtToWebMessage>) => {
       break;
     }
 
-    case 'diary': {
-      // Feature C: Morning Briefing — show as speech on the creature + TTS
-      eventSpeechOverrides.set(message.creatureId, { text: message.entry, timestamp: Date.now() });
-      soundEngine.playMorning();
-      soundEngine.speak(message.entry);
+    case 'nudgeCreature': {
+      // Morning wake-up: gently highlight the creature that needs attention.
+      // The creature's own mood bubble (hungry/sick/etc.) speaks for itself — no AI narrator.
+      const nudgeTarget = creatures.find(c => c.id === message.creatureId);
+      if (nudgeTarget) {
+        renderer.triggerFeedEffect(nudgeTarget.position.x, nudgeTarget.position.y);
+        soundEngine.playSelectAgent();
+      }
       break;
     }
 
@@ -455,11 +522,6 @@ window.addEventListener('message', (event: MessageEvent<ExtToWebMessage>) => {
       // Auto-select the newly added agent
       selectedAgentId = message.agentId;
       renderer.setSelectedAgentId(message.agentId);
-      break;
-    }
-
-    case 'lineupActive': {
-      lineupActive = message.active;
       break;
     }
 
@@ -521,6 +583,29 @@ canvas.addEventListener('click', (event: MouseEvent) => {
     return;
   }
 
+  // Check if clicking on the profile badge/card (UI layer, not affected by zoom)
+  if (selectedCreatureId) {
+    const rect = canvas.getBoundingClientRect();
+    const canvasX = (event.clientX - rect.left) * (CANVAS_WIDTH / rect.width);
+    const canvasY = (event.clientY - rect.top) * (CANVAS_HEIGHT / rect.height);
+
+    if (renderer.isProfileCardOpen()) {
+      // Full card area (bottom-left) — click to close
+      const cardW = 160, cardH = 120;
+      if (canvasX >= 6 && canvasX <= 6 + cardW && canvasY >= CANVAS_HEIGHT - cardH - 6 && canvasY <= CANVAS_HEIGHT - 6) {
+        renderer.toggleProfileCard();
+        return;
+      }
+    } else {
+      // Badge area — click to open
+      const badge = renderer.getProfileBadgeRect();
+      if (canvasX >= badge.x && canvasX <= badge.x + badge.w && canvasY >= badge.y && canvasY <= badge.y + badge.h) {
+        renderer.toggleProfileCard();
+        return;
+      }
+    }
+  }
+
   // Find nearest creature AND agent — pick whichever is closest
   const { id: creatureHit, dist: creatureDist } = findCreatureAtCanvasPosWithDist(worldPos.x, worldPos.y);
   const { id: agentHit, dist: agentDist } = findAgentAtCanvasPosWithDist(worldPos.x, worldPos.y);
@@ -536,7 +621,8 @@ canvas.addEventListener('click', (event: MouseEvent) => {
 
   if (creatureHit) {
     selectedCreatureId = creatureHit;
-    soundEngine.playSelectCreature();
+    const clickedCreature = creatures.find(c => c.id === creatureHit);
+    soundEngine.playSelectCreature(clickedCreature?.species);
     vscode.postMessage({ type: 'revealFile', creatureId: creatureHit });
     return;
   }
@@ -575,6 +661,7 @@ btnCare?.addEventListener('click', () => setActionMode(actionMode === 'care' ? '
 btnMute?.addEventListener('click', () => {
   const newMuted = !soundEngine.isMuted();
   soundEngine.setMuted(newMuted);
+  if (newMuted) { soundEngine.stopAmbient(); }
   if (btnMute) {
     btnMute.textContent = newMuted ? '\u{1F507}' : '\u{1F50A}';
     btnMute.title = newMuted ? t('unmute') : t('mute');
@@ -612,6 +699,98 @@ btnLang?.addEventListener('click', () => {
   vscode.setState({ ...(vscode.getState() as object ?? {}), language: newLang });
 });
 
+// Screenshot button — capture canvas with status card overlay
+btnScreenshot?.addEventListener('click', () => {
+  // Create composite canvas: game + status card
+  const CARD_HEIGHT = 64;
+  const compositeCanvas = document.createElement('canvas');
+  compositeCanvas.width = canvas.width;
+  compositeCanvas.height = canvas.height + CARD_HEIGHT;
+  const cctx = compositeCanvas.getContext('2d')!;
+
+  // Draw game canvas
+  cctx.drawImage(canvas, 0, 0);
+
+  // Draw status card background
+  cctx.fillStyle = '#1A1A1A';
+  cctx.fillRect(0, canvas.height, canvas.width, CARD_HEIGHT);
+  cctx.fillStyle = '#333';
+  cctx.fillRect(0, canvas.height, canvas.width, 1); // separator line
+
+  // Card content
+  const cy = canvas.height + 8;
+  cctx.textBaseline = 'top';
+
+  // Title
+  cctx.fillStyle = '#FFD700';
+  cctx.font = 'bold 11px sans-serif';
+  cctx.fillText('Digital Life', 8, cy);
+
+  // Creature stats
+  const alive = creatures.filter(c => c.stage !== 'egg');
+  const mutated = alive.filter(c => c.mutation);
+  const maxLv = alive.reduce((max, c) => Math.max(max, c.level), 0);
+  const totalDays = alive.length > 0
+    ? Math.floor((Date.now() - Math.min(...alive.map(c => c.bornAt))) / 86400000)
+    : 0;
+
+  cctx.fillStyle = '#AAAAAA';
+  cctx.font = '9px sans-serif';
+  const stats = [
+    `${creatures.length} creatures`,
+    `Max Lv.${maxLv}`,
+    mutated.length > 0 ? `${mutated.length} mutated` : '',
+    totalDays > 0 ? `${totalDays}d survived` : '',
+  ].filter(Boolean).join('  |  ');
+  cctx.fillText(stats, 8, cy + 16);
+
+  // Individual creature badges (up to 6)
+  const display = alive.slice(0, 6);
+  let bx = 8;
+  const by = cy + 32;
+  cctx.font = '8px sans-serif';
+  for (const c of display) {
+    // Species color dot
+    const colors: Record<string, string> = {
+      dot: '#1A1A1A', puff: '#FFB6C1', blob: '#87CEEB',
+      pip: '#FFD700', wisp: '#DDA0DD', chomp: '#90EE90',
+    };
+    cctx.fillStyle = colors[c.species] ?? '#888';
+    cctx.beginPath();
+    cctx.arc(bx + 4, by + 4, 4, 0, Math.PI * 2);
+    cctx.fill();
+    cctx.strokeStyle = '#555';
+    cctx.lineWidth = 0.5;
+    cctx.stroke();
+    // Name + level
+    cctx.fillStyle = '#CCC';
+    const label = `${c.name} Lv.${c.level}`;
+    cctx.fillText(label, bx + 10, by);
+    bx += cctx.measureText(label).width + 18;
+    if (bx > canvas.width - 40) break;
+  }
+
+  // Watermark
+  cctx.fillStyle = '#555';
+  cctx.font = '8px sans-serif';
+  cctx.textAlign = 'right';
+  cctx.fillText('shikakeru.com', canvas.width - 8, cy + 48);
+  cctx.textAlign = 'left';
+
+  const imageData = compositeCanvas.toDataURL('image/png');
+  vscode.postMessage({ type: 'screenshot', imageData });
+
+  // Brief flash effect as feedback
+  const flash = document.createElement('div');
+  flash.style.cssText = 'position:absolute;inset:0;background:#fff;opacity:0.6;pointer-events:none;z-index:999;transition:opacity 0.3s';
+  const wrapper = document.getElementById('canvas-wrapper');
+  wrapper?.appendChild(flash);
+  requestAnimationFrame(() => {
+    flash.style.opacity = '0';
+    setTimeout(() => flash.remove(), 300);
+  });
+});
+
 /** Refresh all toolbar labels/tooltips for current language */
 function applyToolbarLabels(): void {
   const lang = getLanguage();
@@ -621,7 +800,12 @@ function applyToolbarLabels(): void {
   if (btnMute)    { const m = soundEngine.isMuted(); btnMute.textContent = m ? t('tt_unmute') : t('tt_mute'); btnMute.title = m ? t('tt_unmute') : t('tt_mute'); }
   const addAgent = document.getElementById('btn-add-agent');
   if (addAgent)   { addAgent.textContent = '+ ' + t('tt_add_agent'); addAgent.title = t('tt_add_agent'); }
-  if (btnLineup)  { btnLineup.textContent = t('tt_lineup'); btnLineup.title = t('tt_lineup'); }
+  if (btnScreenshot) { btnScreenshot.title = t('tt_screenshot'); }
+  // Dynamic buttons (care approval)
+  const approveEl = document.getElementById('btn-approve-ai');
+  if (approveEl) { approveEl.textContent = t('approve'); }
+  const cancelEl = document.getElementById('btn-cancel-ai');
+  if (cancelEl) { cancelEl.textContent = t('cancel'); }
 }
 
 // ============================================================
@@ -648,10 +832,6 @@ function findCreatureAtCanvasPosWithDist(worldX: number, worldY: number): { id: 
 
   // Return Infinity when nothing found so agent comparison always wins
   return { id: closestId, dist: closestId ? closestDist : Infinity };
-}
-
-function findAgentAtCanvasPos(worldX: number, worldY: number): string | null {
-  return findAgentAtCanvasPosWithDist(worldX, worldY).id;
 }
 
 function findAgentAtCanvasPosWithDist(worldX: number, worldY: number): { id: string | null; dist: number } {
@@ -739,9 +919,9 @@ function handleAction(mode: ActionMode, creature: CreatureData): void {
       soundEngine.playPet();
       showEduMessage(t('care_diagnosing'));
 
-      // Guide: care completed — tutorial done
+      // Guide: care completed — show feature tips
       if (guidePhase === 'waitCare') {
-        advanceGuide('done');
+        advanceGuide('tips');
       }
       break;
   }
@@ -836,13 +1016,39 @@ function advanceGuide(to: GuidePhase): void {
       if (guidePhase !== 'waitCare') return;
       showEduMessage(t('guide_care'));
       btnCare?.classList.add('guide-pulse');
-      // Auto-complete guide after a few seconds (don't force the user)
+      // Auto-advance after a few seconds (don't force the user)
       setTimeout(() => {
         if (guidePhase === 'waitCare') {
-          advanceGuide('done');
+          advanceGuide('tips');
         }
       }, 6000);
     }, 3000);
+  } else if (to === 'tips') {
+    btnCare?.classList.remove('guide-pulse');
+    guidePhase = 'tips';
+    // Show feature tips in sequence
+    const tips = [
+      { msg: () => t('guide_screenshot'), delay: 0, pulse: btnScreenshot },
+      { msg: () => t('guide_starve'), delay: 5000, pulse: null },
+      { msg: () => t('guide_mutation'), delay: 10000, pulse: null },
+    ];
+    for (const tip of tips) {
+      setTimeout(() => {
+        if (guidePhase !== 'tips') return;
+        showEduMessage(tip.msg());
+        if (tip.pulse) {
+          tip.pulse.classList.add('guide-pulse');
+          setTimeout(() => tip.pulse?.classList.remove('guide-pulse'), 4000);
+        }
+      }, tip.delay);
+    }
+    // Complete after all tips shown
+    setTimeout(() => {
+      if (guidePhase === 'tips') {
+        hideEduMessage();
+        guidePhase = 'done';
+      }
+    }, 16000);
   } else if (to === 'done') {
     btnCare?.classList.remove('guide-pulse');
     hideEduMessage();
@@ -858,23 +1064,22 @@ function advanceGuide(to: GuidePhase): void {
 function beginFirstRunCeremony(files: { path: string; name: string; species: string }[]): void {
   if (files.length === 0) return;
 
-  // First friend: spawn immediately as egg (it will hatch via normal hatch logic)
+  // First friend: spawn immediately as egg (hatches in ~5s)
   const first = files[0];
   vscode.postMessage({ type: 'spawnFile', filePath: first.path, name: first.name });
 
-  // Show naming prompt in the edu-message area after a short delay (hatch time)
+  // After hatch (5s) + a beat: start guide flow (feed the hungry creature)
   setTimeout(() => {
-    showNamingPrompt(first.name);
-  }, 2500);
+    startGuide();
+  }, 6500);
 
-  // Remaining files: appear in small batches, staggered
-  // They were always here — quiet arrival, no fanfare
+  // Remaining files: appear in quick batches after first creature hatches
   const rest = files.slice(1);
-  const BATCH = 3;
-  const INTERVAL = 1800;
+  const BATCH = 4;
+  const INTERVAL = 1200;
 
   for (let i = 0; i < rest.length; i++) {
-    const delay = 5000 + Math.floor(i / BATCH) * INTERVAL;
+    const delay = 3000 + Math.floor(i / BATCH) * INTERVAL;
     const file = rest[i];
     setTimeout(() => {
       vscode.postMessage({ type: 'spawnFile', filePath: file.path, name: file.name });
@@ -1004,8 +1209,11 @@ function gameLoop(timestamp: number): void {
         creatures: smoothCreatures, world: worldData, bugCount,
         zoom: zoomLevel, panX, panY,
         selectedCreatureId, draggingCreatureId,
-        agents: smoothAgents, agentChats, eventSpeechOverrides, friendPairs: friendshipPairs, lineupActive,
+        agents: smoothAgents, agentChats, eventSpeechOverrides, friendPairs: friendshipPairs,
       });
+
+      // Update ambient BGM based on weather/time
+      soundEngine.updateAmbient(worldData.weather, worldData.timeOfDay, worldData.realWeather);
     }
   }
 

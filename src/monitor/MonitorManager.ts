@@ -24,6 +24,7 @@ export class MonitorManager {
     private readonly callbacks: MonitorCallbacks
   ) {
     this.codeAnalyzer = new CodeAnalyzer();
+    this.codeAnalyzer.loadCustomPatterns(workspacePath);
 
     this.fileWatcher = new FileWatcher(workspacePath, {
       onFileAdd: (path) => this.handleFileAdd(path),
@@ -53,6 +54,10 @@ export class MonitorManager {
       lastCommitSha: this.gitWatcher.getLastSha(),
       lastCommitTime: this.gitWatcher.getLastCommitTime(),
     };
+  }
+
+  async getCommitStreak(): Promise<number> {
+    return this.gitWatcher.getCommitStreak();
   }
 
   getBugCount(): number {
